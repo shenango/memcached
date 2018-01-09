@@ -11,7 +11,6 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 
 #ifdef __sun
 #include <atomic.h>
@@ -19,6 +18,7 @@
 
 #define ITEMS_PER_ALLOC 64
 
+#if 0
 /* An item in the connection queue. */
 enum conn_queue_item_modes {
     queue_new_conn,   /* brand new connection. */
@@ -43,49 +43,48 @@ struct conn_queue {
     CQ_ITEM *tail;
     pthread_mutex_t lock;
 };
+#endif
 
 /* Locks for cache LRU operations */
-pthread_mutex_t lru_locks[POWER_LARGEST];
+mutex_t lru_locks[POWER_LARGEST];
 
+#if 0
 /* Connection lock around accepting new connections */
 pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 #if !defined(HAVE_GCC_ATOMICS) && !defined(__sun)
-pthread_mutex_t atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
+#error
 #endif
 
 /* Lock for global stats */
-static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static mutex_t stats_lock;
 
+#if 0
 /* Lock to cause worker threads to hang up after being woken */
 static pthread_mutex_t worker_hang_lock;
 
 /* Free list of CQ_ITEM structs */
 static CQ_ITEM *cqi_freelist;
 static pthread_mutex_t cqi_freelist_lock;
+#endif
 
-static pthread_mutex_t *item_locks;
+static mutex_t *item_locks;
 /* size of the item lock hash table */
 static uint32_t item_lock_count;
 unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
-/*
- * Each libevent instance has a wakeup pipe, which other threads
- * can use to signal that they've put a new connection on its queue.
- */
-static LIBEVENT_THREAD *threads;
+static PHYS_THREAD *threads;
+__thread PHYS_THREAD *mythr_ptr = NULL;
 
 /*
  * Number of worker threads that have finished setting themselves up.
  */
 static int init_count = 0;
-static pthread_mutex_t init_lock;
-static pthread_cond_t init_cond;
+static DEFINE_SPINLOCK(init_lock);
 
-
-static void thread_libevent_process(int fd, short which, void *arg);
 
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
@@ -100,21 +99,22 @@ void item_lock(uint32_t hv) {
 }
 
 void *item_trylock(uint32_t hv) {
-    pthread_mutex_t *lock = &item_locks[hv & hashmask(item_lock_hashpower)];
-    if (pthread_mutex_trylock(lock) == 0) {
+    mutex_t *lock = &item_locks[hv & hashmask(item_lock_hashpower)];
+    if (mutex_try_lock(lock)) {
         return lock;
     }
     return NULL;
 }
 
 void item_trylock_unlock(void *lock) {
-    mutex_unlock((pthread_mutex_t *) lock);
+    mutex_unlock((mutex_t *) lock);
 }
 
 void item_unlock(uint32_t hv) {
     mutex_unlock(&item_locks[hv & hashmask(item_lock_hashpower)]);
 }
 
+#if 0
 static void wait_for_thread_registration(int nthreads) {
     while (init_count < nthreads) {
         pthread_cond_wait(&init_cond, &init_lock);
@@ -130,9 +130,12 @@ static void register_thread_initialized(void) {
     pthread_mutex_lock(&worker_hang_lock);
     pthread_mutex_unlock(&worker_hang_lock);
 }
+#endif
 
 /* Must not be called with any deeper locks held */
 void pause_threads(enum pause_thread_types type) {
+    BUG(); // Not implementing pausing worker threads.
+#if 0
     char buf[1];
     int i;
 
@@ -180,8 +183,10 @@ void pause_threads(enum pause_thread_types type) {
     }
     wait_for_thread_registration(settings.num_threads);
     pthread_mutex_unlock(&init_lock);
+#endif
 }
 
+#if 0
 /*
  * Initializes a connection queue.
  */
@@ -303,12 +308,14 @@ void accept_new_conns(const bool do_accept) {
     do_accept_new_conns(do_accept);
     pthread_mutex_unlock(&conn_lock);
 }
+#endif
 /****************************** LIBEVENT THREADS *****************************/
 
 /*
  * Set up a thread's information.
  */
-static void setup_thread(LIBEVENT_THREAD *me) {
+static void setup_thread(PHYS_THREAD *me) {
+#if 0
 #if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
     struct event_config *ev_config;
     ev_config = event_config_new();
@@ -345,6 +352,8 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         perror("Failed to initialize mutex");
         exit(EXIT_FAILURE);
     }
+#endif
+    mutex_init(&me->stats.mutex);
 
     me->suffix_cache = cache_create("suffix", SUFFIX_SIZE, sizeof(char*),
                                     NULL, NULL);
@@ -361,6 +370,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
 #endif
 }
 
+#if 0
 /*
  * Worker thread: main event loop
  */
@@ -496,12 +506,14 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
         perror("Writing to thread notify pipe");
     }
 }
+#endif
 
 /*
  * Re-dispatches a connection back to the original thread. Can be called from
  * any side thread borrowing a connection.
  */
 void redispatch_conn(conn *c) {
+#if 0
     CQ_ITEM *item = cqi_new();
     char buf[1];
     if (item == NULL) {
@@ -522,10 +534,14 @@ void redispatch_conn(conn *c) {
     if (write(thread->notify_send_fd, buf, 1) != 1) {
         perror("Writing to thread notify pipe");
     }
+#endif
+    c->state = conn_new_cmd;
+    thread_spawn(drive_machine, c);
 }
 
 /* This misses the allow_new_conns flag :( */
 void sidethread_conn_close(conn *c) {
+#if 0
     c->state = conn_closed;
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed from side thread.\n", c->sfd);
@@ -536,6 +552,26 @@ void sidethread_conn_close(conn *c) {
     STATS_UNLOCK();
 
     return;
+#endif
+    c->state = conn_closing;
+    thread_spawn(drive_machine, c);
+}
+
+
+int memcached_perthread_init(void) {
+    spin_lock(&init_lock);
+    BUG_ON(mythr_ptr != NULL);
+    BUG_ON(init_count >= settings.num_threads);
+    mythr_ptr = &threads[init_count++];
+    spin_unlock(&init_lock);
+
+    mythr_ptr->l = logger_create();
+    mythr_ptr->lru_bump_buf = item_lru_bump_buf_create();
+    if (mythr_ptr->l == NULL || mythr_ptr->lru_bump_buf == NULL) {
+        abort();
+    }
+
+    return 0;
 }
 
 /********************************* ITEM ACCESS *******************************/
@@ -655,17 +691,17 @@ enum store_item_type store_item(item *item, int comm, conn* c) {
 /******************************* GLOBAL STATS ******************************/
 
 void STATS_LOCK() {
-    pthread_mutex_lock(&stats_lock);
+    mutex_lock(&stats_lock);
 }
 
 void STATS_UNLOCK() {
-    pthread_mutex_unlock(&stats_lock);
+    mutex_unlock(&stats_lock);
 }
 
 void threadlocal_stats_reset(void) {
     int ii;
     for (ii = 0; ii < settings.num_threads; ++ii) {
-        pthread_mutex_lock(&threads[ii].stats.mutex);
+        mutex_lock(&threads[ii].stats.mutex);
 #define X(name) threads[ii].stats.name = 0;
         THREAD_STATS_FIELDS
 #ifdef EXTSTORE
@@ -678,7 +714,7 @@ void threadlocal_stats_reset(void) {
         memset(&threads[ii].stats.lru_hits, 0,
                 sizeof(uint64_t) * POWER_LARGEST);
 
-        pthread_mutex_unlock(&threads[ii].stats.mutex);
+        mutex_unlock(&threads[ii].stats.mutex);
     }
 }
 
@@ -690,7 +726,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
     memset(stats, 0, sizeof(*stats));
 
     for (ii = 0; ii < settings.num_threads; ++ii) {
-        pthread_mutex_lock(&threads[ii].stats.mutex);
+        mutex_lock(&threads[ii].stats.mutex);
 #define X(name) stats->name += threads[ii].stats.name;
         THREAD_STATS_FIELDS
 #ifdef EXTSTORE
@@ -712,7 +748,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
                 threads[ii].stats.lru_hits[sid];
         }
 
-        pthread_mutex_unlock(&threads[ii].stats.mutex);
+        mutex_unlock(&threads[ii].stats.mutex);
     }
 }
 
@@ -738,15 +774,10 @@ void memcached_thread_init(int nthreads, void *arg) {
     int         power;
 
     for (i = 0; i < POWER_LARGEST; i++) {
-        pthread_mutex_init(&lru_locks[i], NULL);
+        mutex_init(&lru_locks[i]);
     }
-    pthread_mutex_init(&worker_hang_lock, NULL);
 
-    pthread_mutex_init(&init_lock, NULL);
-    pthread_cond_init(&init_cond, NULL);
-
-    pthread_mutex_init(&cqi_freelist_lock, NULL);
-    cqi_freelist = NULL;
+    spin_lock_init(&init_lock);
 
     /* Want a wide lock table, but don't waste memory */
     if (nthreads < 3) {
@@ -768,28 +799,29 @@ void memcached_thread_init(int nthreads, void *arg) {
         fprintf(stderr, "Hash table power size (%d) cannot be equal to or less than item lock table (%d)\n", hashpower, power);
         fprintf(stderr, "Item lock table grows with `-t N` (worker threadcount)\n");
         fprintf(stderr, "Hash table grows with `-o hashpower=N` \n");
-        exit(1);
+        BUG();
     }
 
     item_lock_count = hashsize(power);
     item_lock_hashpower = power;
 
-    item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
+    item_locks = calloc(item_lock_count, sizeof(mutex_t));
     if (! item_locks) {
         perror("Can't allocate item locks");
         exit(1);
     }
     for (i = 0; i < item_lock_count; i++) {
-        pthread_mutex_init(&item_locks[i], NULL);
+        mutex_init(&item_locks[i]);
     }
 
-    threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
+    threads = calloc(nthreads, sizeof(PHYS_THREAD));
     if (! threads) {
         perror("Can't allocate thread descriptors");
         exit(1);
     }
 
     for (i = 0; i < nthreads; i++) {
+#if 0
         int fds[2];
         if (pipe(fds)) {
             perror("Can't create notify pipe");
@@ -801,11 +833,14 @@ void memcached_thread_init(int nthreads, void *arg) {
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
+
+#endif
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
     }
 
+#if 0
     /* Create threads after we've done all the libevent setup. */
     for (i = 0; i < nthreads; i++) {
         create_worker(worker_libevent, &threads[i]);
@@ -815,5 +850,9 @@ void memcached_thread_init(int nthreads, void *arg) {
     pthread_mutex_lock(&init_lock);
     wait_for_thread_registration(nthreads);
     pthread_mutex_unlock(&init_lock);
+#endif
+
+    mutex_init(&stats_lock);
+
 }
 

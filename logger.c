@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include <poll.h>
 #include <ctype.h>
 
 #if defined(__sun)
@@ -13,6 +12,7 @@
 
 #include "memcached.h"
 #include "bipbuffer.h"
+#include <stdarg.h>
 
 #ifdef LOGGER_DEBUG
 #define L_DEBUG(...) \
@@ -29,18 +29,15 @@ static logger *logger_stack_head = NULL;
 static logger *logger_stack_tail = NULL;
 static unsigned int logger_count = 0;
 static volatile int do_run_logger_thread = 1;
-static pthread_t logger_tid;
-pthread_mutex_t logger_stack_lock = PTHREAD_MUTEX_INITIALIZER;
-
-pthread_key_t logger_key;
+static waitgroup_t logger_wg;
+static DEFINE_SPINLOCK(logger_stack_lock);
 
 #if !defined(HAVE_GCC_64ATOMICS) && !defined(__sun)
-pthread_mutex_t logger_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
+mutex_t logger_atomics_mutex;
 #endif
 
 #define WATCHER_LIMIT 20
 logger_watcher *watchers[20];
-struct pollfd watchers_pollfds[20];
 int watcher_count = 0;
 
 /* Should this go somewhere else? */
@@ -106,7 +103,7 @@ static uint64_t logger_get_gid(void) {
  */
 /* Add to the list of threads with a logger object */
 static void logger_link_q(logger *l) {
-    pthread_mutex_lock(&logger_stack_lock);
+    spin_lock(&logger_stack_lock);
     assert(l != logger_stack_head);
 
     l->prev = 0;
@@ -115,7 +112,7 @@ static void logger_link_q(logger *l) {
     logger_stack_head = l;
     if (logger_stack_tail == 0) logger_stack_tail = l;
     logger_count++;
-    pthread_mutex_unlock(&logger_stack_lock);
+    spin_unlock(&logger_stack_lock);
     return;
 }
 
@@ -156,9 +153,9 @@ static void logger_set_flags(void) {
         f |= w->eflags;
     }
     for (l = logger_stack_head; l != NULL; l=l->next) {
-        pthread_mutex_lock(&l->mutex);
+        mutex_lock(&l->mutex);
         l->eflags = f;
-        pthread_mutex_unlock(&l->mutex);
+        mutex_unlock(&l->mutex);
     }
     return;
 }
@@ -295,7 +292,7 @@ static void logger_thread_write_entry(logentry *e, struct logger_stats *ls,
         }
 
         if (w->failed_flush) {
-            L_DEBUG("LOGGER: Fast skipped for watcher [%d] due to failed_flush\n", w->sfd);
+            L_DEBUG("LOGGER: Fast skipped for watcher [%p] due to failed_flush\n", w);
             w->skipped++;
             ls->watcher_skipped++;
             continue;
@@ -304,7 +301,7 @@ static void logger_thread_write_entry(logentry *e, struct logger_stats *ls,
         if (w->skipped > 0) {
             total = snprintf(skip_scr, 128, "skipped=%llu\n", (unsigned long long) w->skipped);
             if (total >= 128 || total <= 0) {
-                L_DEBUG("LOGGER: Failed to flatten skipped message into watcher [%d]\n", w->sfd);
+                L_DEBUG("LOGGER: Failed to flatten skipped message into watcher [%p]\n", w);
                 w->skipped++;
                 ls->watcher_skipped++;
                 continue;
@@ -342,9 +339,9 @@ static int logger_thread_read(logger *l, struct logger_stats *ls) {
     unsigned char *data;
     char scratch[LOGGER_PARSE_SCRATCH];
     logentry *e;
-    pthread_mutex_lock(&l->mutex);
+    mutex_lock(&l->mutex);
     data = bipbuf_peek_all(l->buf, &size);
-    pthread_mutex_unlock(&l->mutex);
+    mutex_unlock(&l->mutex);
 
     if (data == NULL) {
         return 0;
@@ -367,18 +364,33 @@ static int logger_thread_read(logger *l, struct logger_stats *ls) {
     }
     assert(pos <= size);
 
-    pthread_mutex_lock(&l->mutex);
+    mutex_lock(&l->mutex);
     data = bipbuf_poll(l->buf, size);
     ls->worker_written += l->written;
     ls->worker_dropped += l->dropped;
     l->written = 0;
     l->dropped = 0;
-    pthread_mutex_unlock(&l->mutex);
+    mutex_unlock(&l->mutex);
     if (data == NULL) {
         fprintf(stderr, "LOGGER: unexpectedly couldn't advance buf pointer\n");
-        assert(0);
+        BUG();
     }
     return size; /* maybe the count of objects iterated? */
+}
+
+static int flush_udp(unsigned char *data, unsigned int data_size, conn *c)
+{
+    int total = data_size, ret, tosend, done = 0;
+    do {
+        tosend = min(data_size - done, UDP_MAX_PAYLOAD);
+        ret = udp_respond(data + done, tosend, c->spawn_data);
+        if (ret < 0 || ret != tosend) {
+            total = ret;
+            break;
+        }
+        done += tosend;
+    } while (data_size - done > 0);
+    return total;
 }
 
 /* Since the event loop code isn't reusable without a refactor, and we have a
@@ -394,11 +406,14 @@ static int logger_thread_read(logger *l, struct logger_stats *ls) {
  */
 static int logger_thread_poll_watchers(int force_poll, int watcher) {
     int x;
+#if 0
     int nfd = 0;
+#endif
     unsigned char *data;
     unsigned int data_size = 0;
     int flushed = 0;
 
+#if 0
     for (x = 0; x < WATCHER_LIMIT; x++) {
         logger_watcher *w = watchers[x];
         if (w == NULL || (watcher != WATCHER_ALL && x != watcher))
@@ -432,6 +447,7 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
     }
 
     nfd = 0;
+#endif
     for (x = 0; x < WATCHER_LIMIT; x++) {
         logger_watcher *w = watchers[x];
         if (w == NULL)
@@ -441,6 +457,7 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
         /* Early detection of a disconnect. Otherwise we have to wait until
          * the next write
          */
+#if 0
         if (watchers_pollfds[nfd].revents & POLLIN) {
             char buf[1];
             int res = read(w->sfd, buf, 1);
@@ -451,11 +468,14 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
                 continue;
             }
         }
+#endif
         if ((data = bipbuf_peek_all(w->buf, &data_size)) != NULL) {
+#if 0
             if (watchers_pollfds[nfd].revents & (POLLHUP|POLLERR)) {
                 L_DEBUG("LOGGER: watcher closed during poll() call\n");
                 logger_thread_close_watcher(w);
             } else if (watchers_pollfds[nfd].revents & POLLOUT) {
+#endif
                 int total = 0;
 
                 /* We can write a bit. */
@@ -464,14 +484,16 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
                         total = fwrite(data, 1, data_size, stderr);
                         break;
                     case LOGGER_WATCHER_CLIENT:
-                        total = write(w->sfd, data, data_size);
+                        if (IS_UDP(((conn *)w->c)->transport))
+                            total = flush_udp(data, data_size, w->c);
+                        else
+                            BUG(); // TODO
                         break;
                 }
-
-                L_DEBUG("LOGGER: poll() wrote %d to %d (data_size: %d) (bipbuf_used: %d)\n", total, w->sfd,
+                L_DEBUG("LOGGER: poll() wrote %d to %p (data_size: %d) (bipbuf_used: %d)\n", total, w,
                         data_size, bipbuf_used(w->buf));
-                if (total == -1) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (total < 0) {
+                    if (total != EAGAIN && total != EWOULDBLOCK) {
                         logger_thread_close_watcher(w);
                     }
                     L_DEBUG("LOGGER: watcher hit EAGAIN\n");
@@ -482,8 +504,10 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
                     flushed += total;
                 }
             }
+#if 0
         }
         nfd++;
+#endif
     }
     return flushed;
 }
@@ -501,7 +525,7 @@ static void logger_thread_sum_stats(struct logger_stats *ls) {
 #define MIN_LOGGER_SLEEP 1000
 
 /* Primary logger thread routine */
-static void *logger_thread(void *arg) {
+static void logger_thread(void *arg) {
     useconds_t to_sleep = MIN_LOGGER_SLEEP;
     L_DEBUG("LOGGER: Starting logger thread\n");
     while (do_run_logger_thread) {
@@ -512,17 +536,17 @@ static void *logger_thread(void *arg) {
 
         /* only sleep if we're *above* the minimum */
         if (to_sleep > MIN_LOGGER_SLEEP)
-            usleep(to_sleep);
+            timer_sleep(to_sleep);
 
         /* Call function to iterate each logger. */
-        pthread_mutex_lock(&logger_stack_lock);
+        spin_lock(&logger_stack_lock);
         for (l = logger_stack_head; l != NULL; l=l->next) {
             /* lock logger, call function to manipulate it */
             found_logs += logger_thread_read(l, &ls);
         }
 
         logger_thread_poll_watchers(1, WATCHER_ALL);
-        pthread_mutex_unlock(&logger_stack_lock);
+        spin_unlock(&logger_stack_lock);
 
         /* TODO: abstract into a function and share with lru_crawler */
         if (!found_logs) {
@@ -538,15 +562,17 @@ static void *logger_thread(void *arg) {
         logger_thread_sum_stats(&ls);
     }
 
-    return NULL;
+    waitgroup_done(&logger_wg);
 }
 
-static int start_logger_thread(void) {
+int start_logger_thread(void) {
     int ret;
     do_run_logger_thread = 1;
-    if ((ret = pthread_create(&logger_tid, NULL,
-                              logger_thread, NULL)) != 0) {
+    waitgroup_init(&logger_wg);
+    waitgroup_add(&logger_wg, 1);
+    if ((ret = thread_spawn(logger_thread, NULL)) != 0) {
         fprintf(stderr, "Can't start logger thread: %s\n", strerror(ret));
+        waitgroup_done(&logger_wg);
         return -1;
     }
     return 0;
@@ -571,19 +597,16 @@ void logger_init(void) {
     /* init stack for iterating loggers */
     logger_stack_head = 0;
     logger_stack_tail = 0;
-    pthread_key_create(&logger_key, NULL);
 
-    if (start_logger_thread() != 0) {
-        abort();
-    }
+    spin_lock_init(&logger_stack_lock);
+    mutex_init(&logger_atomics_mutex);
+
 
     /* This can be removed once the global stats initializer is improved */
-    STATS_LOCK();
     stats.log_worker_dropped = 0;
     stats.log_worker_written = 0;
     stats.log_watcher_skipped = 0;
     stats.log_watcher_sent = 0;
-    STATS_UNLOCK();
     /* This is what adding a STDERR watcher looks like. should replace old
      * "verbose" settings. */
     //logger_add_watcher(NULL, 0);
@@ -608,8 +631,7 @@ logger *logger_create(void) {
 
     l->entry_map = default_entries;
 
-    pthread_mutex_init(&l->mutex, NULL);
-    pthread_setspecific(logger_key, l);
+    mutex_init(&l->mutex);
 
     /* add to list of loggers */
     logger_link_q(l);
@@ -691,11 +713,11 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
     const entry_details *d = &l->entry_map[event];
     int reqlen = d->reqlen;
 
-    pthread_mutex_lock(&l->mutex);
+    mutex_lock(&l->mutex);
     /* Request a maximum length of data to write to */
     e = (logentry *) bipbuf_request(buf, (sizeof(logentry) + reqlen));
     if (e == NULL) {
-        pthread_mutex_unlock(&l->mutex);
+        mutex_unlock(&l->mutex);
         l->dropped++;
         return LOGGER_RET_NOSPACE;
     }
@@ -757,14 +779,14 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
     /* Push pointer forward by the actual amount required */
     if (bipbuf_push(buf, (sizeof(logentry) + e->size)) == 0) {
         fprintf(stderr, "LOGGER: Failed to bipbuf push a text entry\n");
-        pthread_mutex_unlock(&l->mutex);
+        mutex_unlock(&l->mutex);
         return LOGGER_RET_ERR;
     }
     l->written++;
     L_DEBUG("LOGGER: Requested %d bytes, wrote %lu bytes\n", reqlen,
             (sizeof(logentry) + e->size));
 
-    pthread_mutex_unlock(&l->mutex);
+    mutex_unlock(&l->mutex);
 
     if (nospace) {
         return LOGGER_RET_NOSPACE;
@@ -777,10 +799,10 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
  * logger thread. Caller *must* event_del() the client before handing it over.
  * Presently there's no way to hand the client back to the worker thread.
  */
-enum logger_add_watcher_ret logger_add_watcher(void *c, const int sfd, uint16_t f) {
+enum logger_add_watcher_ret logger_add_watcher(void *c, uint16_t f) {
     int x;
     logger_watcher *w = NULL;
-    pthread_mutex_lock(&logger_stack_lock);
+    spin_lock(&logger_stack_lock);
     if (watcher_count >= WATCHER_LIMIT) {
         return LOGGER_ADD_WATCHER_TOO_MANY;
     }
@@ -792,12 +814,11 @@ enum logger_add_watcher_ret logger_add_watcher(void *c, const int sfd, uint16_t 
 
     w = calloc(1, sizeof(logger_watcher));
     if (w == NULL) {
-        pthread_mutex_unlock(&logger_stack_lock);
+        spin_unlock(&logger_stack_lock);
         return LOGGER_ADD_WATCHER_FAILED;
     }
     w->c = c;
-    w->sfd = sfd;
-    if (sfd == 0 && c == NULL) {
+    if (c == NULL) {
         w->t = LOGGER_WATCHER_STDERR;
     } else {
         w->t = LOGGER_WATCHER_CLIENT;
@@ -807,16 +828,17 @@ enum logger_add_watcher_ret logger_add_watcher(void *c, const int sfd, uint16_t 
     w->buf = bipbuf_new(settings.logger_watcher_buf_size);
     if (w->buf == NULL) {
         free(w);
-        pthread_mutex_unlock(&logger_stack_lock);
+        spin_unlock(&logger_stack_lock);
         return LOGGER_ADD_WATCHER_FAILED;
     }
     bipbuf_offer(w->buf, (unsigned char *) "OK\r\n", 4);
 
     watchers[x] = w;
     watcher_count++;
+
     /* Update what flags the global logs will watch */
     logger_set_flags();
 
-    pthread_mutex_unlock(&logger_stack_lock);
+    spin_unlock(&logger_stack_lock);
     return LOGGER_ADD_WATCHER_OK;
 }

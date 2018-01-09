@@ -19,7 +19,6 @@
 #endif
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <signal.h>
 #include <sys/param.h>
 #include <sys/resource.h>
@@ -38,15 +37,10 @@
 #endif
 #include <pwd.h>
 #include <sys/mman.h>
-#include <fcntl.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
 #include <errno.h>
-#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <assert.h>
 #include <limits.h>
 #include <sysexits.h>
 #include <stddef.h>
@@ -67,11 +61,21 @@
 #endif
 #endif
 
+#define htonll(x) hton64(x)
+#define htonl(x) hton32(x)
+#define htons(x) hton16(x)
+#define ntohll(x) ntoh64(x)
+#define ntohl(x) ntoh32(x)
+#define ntohs(x) ntoh16(x)
+
+static struct tcache *udp_conn_tcache;
+static __thread struct tcache_perthread udp_conn_tcache_pt;
+static struct tcache *tcp_conn_tcache;
+static __thread struct tcache_perthread tcp_conn_tcache_pt;
+
 /*
  * forward declarations
  */
-static void drive_machine(conn *c);
-static int new_socket(struct addrinfo *ai);
 static int try_read_command(conn *c);
 
 enum try_read_result {
@@ -82,26 +86,24 @@ enum try_read_result {
 };
 
 static enum try_read_result try_read_network(conn *c);
-static enum try_read_result try_read_udp(conn *c);
 
 static void conn_set_state(conn *c, enum conn_states state);
-static int start_conn_timeout_thread();
 
 /* stats */
 static void stats_init(void);
 static void server_stats(ADD_STAT add_stats, conn *c);
 static void process_stat_settings(ADD_STAT add_stats, void *c);
-static void conn_to_str(const conn *c, char *buf);
 
 
 /* defaults */
 static void settings_init(void);
 
 /* event handling, network IO */
-static void event_handler(const int fd, const short which, void *arg);
+static void udp_handler(struct udp_spawn_data *d);
 static void conn_close(conn *c);
-static void conn_init(void);
-static bool update_event(conn *c, const int new_flags);
+conn *conn_new(enum conn_states init_state,
+                const int read_buffer_size,
+                enum network_transport transport);
 static void complete_nread(conn *c);
 static void process_command(conn *c, char *command);
 static void write_and_free(conn *c, char *buf, int bytes);
@@ -124,7 +126,6 @@ struct stats stats;
 struct stats_state stats_state;
 struct settings settings;
 time_t process_started;     /* when the process was started */
-conn **conns;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
@@ -135,9 +136,11 @@ volatile int slab_rebalance_signal;
 void *ext_storage;
 #endif
 /** file scope variables **/
+#if 0
 static conn *listen_conn = NULL;
 static int max_fds;
 static struct event_base *main_base;
+#endif
 
 enum transmit_result {
     TRANSMIT_COMPLETE,   /** All done writing. */
@@ -148,6 +151,7 @@ enum transmit_result {
 
 static enum transmit_result transmit(conn *c);
 
+#if 0
 /* This reduces the latency without adding lots of extra wiring to be able to
  * notify the listener thread of when to listen again.
  * Also, the clock timer could be broken out into its own thread and we
@@ -168,6 +172,7 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
         accept_new_conns(true);
     }
 }
+#endif
 
 #define REALTIME_MAXDELTA 60*60*24*30
 
@@ -221,8 +226,8 @@ static void stats_reset(void) {
 static void settings_init(void) {
     settings.use_cas = true;
     settings.access = 0700;
-    settings.port = 11211;
-    settings.udpport = 0;
+    settings.port = 0;
+    settings.udpport = 11211;
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
@@ -271,7 +276,7 @@ static void settings_init(void) {
     settings.crawls_persleep = 1000;
     settings.logger_watcher_buf_size = LOGGER_WATCHER_BUF_SIZE;
     settings.logger_buf_size = LOGGER_BUF_SIZE;
-    settings.drop_privileges = true;
+    settings.drop_privileges = false;
 #ifdef MEMCACHED_DEBUG
     settings.relaxed_privileges = false;
 #endif
@@ -308,10 +313,12 @@ static int add_msghdr(conn *c)
 
     msg->msg_iov = &c->iov[c->iovused];
 
+#if 0
     if (IS_UDP(c->transport) && c->request_addr_size > 0) {
         msg->msg_name = &c->request_addr;
         msg->msg_namelen = c->request_addr_size;
     }
+#endif
 
     c->msgbytes = 0;
     c->msgused++;
@@ -324,6 +331,7 @@ static int add_msghdr(conn *c)
     return 0;
 }
 
+#if 0
 extern pthread_mutex_t conn_lock;
 
 /* Connection timeout thread bits */
@@ -441,6 +449,7 @@ static void conn_init(void) {
         exit(1);
     }
 }
+#endif
 
 static const char *prot_text(enum protocol prot) {
     char *rv = "unknown";
@@ -458,20 +467,21 @@ static const char *prot_text(enum protocol prot) {
     return rv;
 }
 
+#if 0
 void conn_close_idle(conn *c) {
     if (settings.idle_timeout > 0 &&
         (current_time - c->last_cmd_time) > settings.idle_timeout) {
         if (c->state != conn_new_cmd && c->state != conn_read) {
             if (settings.verbose > 1)
                 fprintf(stderr,
-                    "fd %d wants to timeout, but isn't in read state", c->sfd);
+                    "fd %p wants to timeout, but isn't in read state", c);
             return;
         }
 
         if (settings.verbose > 1)
-            fprintf(stderr, "Closing idle fd %d\n", c->sfd);
+            fprintf(stderr, "Closing idle fd %p\n", c);
 
-        c->thread->stats.idle_kicks++;
+        mythr()->stats.idle_kicks++;
 
         conn_set_state(c, conn_closing);
         drive_machine(c);
@@ -498,24 +508,21 @@ void conn_worker_readd(conn *c) {
     }
 #endif
 }
+#endif
 
-conn *conn_new(const int sfd, enum conn_states init_state,
-                const int event_flags,
-                const int read_buffer_size, enum network_transport transport,
-                struct event_base *base) {
+conn *conn_new(enum conn_states init_state,
+                const int read_buffer_size,
+                enum network_transport transport) {
     conn *c;
 
-    assert(sfd >= 0 && sfd < max_fds);
-    c = conns[sfd];
-
-    if (NULL == c) {
-        if (!(c = (conn *)calloc(1, sizeof(conn)))) {
+        if (!(c = (conn *)aligned_alloc(CACHE_LINE_SIZE, sizeof(conn)))) {
             STATS_LOCK();
             stats.malloc_fails++;
             STATS_UNLOCK();
             fprintf(stderr, "Failed to allocate connection object\n");
             return NULL;
         }
+        memset(c, 0, sizeof(conn));
         MEMCACHED_CONN_CREATE(c);
 
         c->rbuf = c->wbuf = 0;
@@ -550,17 +557,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             return NULL;
         }
 
-        STATS_LOCK();
-        stats_state.conn_structs++;
-        STATS_UNLOCK();
-
-        c->sfd = sfd;
-        conns[sfd] = c;
-    }
-
     c->transport = transport;
     c->protocol = settings.binding_protocol;
 
+#if 0
     /* unix socket mode doesn't need this, so zeroed out.  but why
      * is this done for every command?  presumably for UDP
      * mode.  */
@@ -577,24 +577,22 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             memset(&c->request_addr, 0, sizeof(c->request_addr));
         }
     }
+#endif
 
     if (settings.verbose > 1) {
-        if (init_state == conn_listening) {
-            fprintf(stderr, "<%d server listening (%s)\n", sfd,
-                prot_text(c->protocol));
-        } else if (IS_UDP(transport)) {
-            fprintf(stderr, "<%d server listening (udp)\n", sfd);
+        if (IS_UDP(transport)) {
+            fprintf(stderr, "<%p server listening (udp)\n", c);
         } else if (c->protocol == negotiating_prot) {
-            fprintf(stderr, "<%d new auto-negotiating client connection\n",
-                    sfd);
+            fprintf(stderr, "<%p new auto-negotiating client connection\n",
+                    c);
         } else if (c->protocol == ascii_prot) {
-            fprintf(stderr, "<%d new ascii client connection.\n", sfd);
+            fprintf(stderr, "<%p new ascii client connection.\n", c);
         } else if (c->protocol == binary_prot) {
-            fprintf(stderr, "<%d new binary client connection.\n", sfd);
+            fprintf(stderr, "<%p new binary client connection.\n", c);
         } else {
-            fprintf(stderr, "<%d new unknown (%d) client connection\n",
-                sfd, c->protocol);
-            assert(false);
+            fprintf(stderr, "<%p new unknown (%d) client connection\n",
+                c, c->protocol);
+            BUG();
         }
     }
 
@@ -625,6 +623,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->noreply = false;
 
+#if 0
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
@@ -638,6 +637,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     stats_state.curr_conns++;
     stats.total_conns++;
     STATS_UNLOCK();
+#endif
 
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
@@ -717,7 +717,7 @@ static void conn_release_items(conn *c) {
 
     if (c->suffixleft != 0) {
         for (; c->suffixleft > 0; c->suffixleft--, c->suffixcurr++) {
-            do_cache_free(c->thread->suffix_cache, *(c->suffixcurr));
+            do_cache_free(mythr()->suffix_cache, *(c->suffixcurr));
         }
     }
 #ifdef EXTSTORE
@@ -736,26 +736,6 @@ static void conn_release_items(conn *c) {
     c->suffixcurr = c->suffixlist;
 }
 
-static void conn_cleanup(conn *c) {
-    assert(c != NULL);
-
-    conn_release_items(c);
-
-    if (c->write_and_free) {
-        free(c->write_and_free);
-        c->write_and_free = 0;
-    }
-
-    if (c->sasl_conn) {
-        assert(settings.sasl);
-        sasl_dispose(&c->sasl_conn);
-        c->sasl_conn = NULL;
-    }
-
-    if (IS_UDP(c->transport)) {
-        conn_set_state(c, conn_read);
-    }
-}
 
 /*
  * Frees a connection.
@@ -763,10 +743,8 @@ static void conn_cleanup(conn *c) {
 void conn_free(conn *c) {
     if (c) {
         assert(c != NULL);
-        assert(c->sfd >= 0 && c->sfd < max_fds);
 
         MEMCACHED_CONN_DESTROY(c);
-        conns[c->sfd] = NULL;
         if (c->hdrbuf)
             free(c->hdrbuf);
         if (c->msglist)
@@ -785,28 +763,80 @@ void conn_free(conn *c) {
     }
 }
 
+static void conn_tcache_free(struct tcache *tc, int nr, void **items)
+{
+    for (int i = 0; i < nr; i++)
+        conn_free(items[i]);
+}
+
+static int udp_conn_tcache_alloc(struct tcache *tc, int nr, void **items)
+{
+    int i;
+
+    for (i = 0; i < nr; i++) {
+        items[i] = conn_new(conn_parse_cmd, UDP_READ_BUFFER_SIZE, udp_transport);
+        if (items[i] == NULL) {
+            conn_tcache_free(tc, i, items);
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
+static int tcp_conn_tcache_alloc(struct tcache *tc, int nr, void **items)
+{
+    int i;
+
+    for (i = 0; i < nr; i++) {
+        items[i] = conn_new(conn_read, DATA_BUFFER_SIZE, tcp_transport);
+        if (items[i] == NULL) {
+            conn_tcache_free(tc, i, items);
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
+static const struct tcache_ops udp_conn_tcache_ops = {
+    .alloc = udp_conn_tcache_alloc, .free = conn_tcache_free,
+};
+
+static const struct tcache_ops tcp_conn_tcache_ops = {
+    .alloc = tcp_conn_tcache_alloc, .free = conn_tcache_free,
+};
+
+
 static void conn_close(conn *c) {
     assert(c != NULL);
 
-    /* delete the event, the socket and the conn */
-    event_del(&c->event);
-
     if (settings.verbose > 1)
-        fprintf(stderr, "<%d connection closed.\n", c->sfd);
+        fprintf(stderr, "<%p connection closed.\n", c);
 
-    conn_cleanup(c);
+    conn_release_items(c);
 
-    MEMCACHED_CONN_RELEASE(c->sfd);
-    conn_set_state(c, conn_closed);
-    close(c->sfd);
+    if (c->write_and_free) {
+        free(c->write_and_free);
+        c->write_and_free = 0;
+    }
 
-    pthread_mutex_lock(&conn_lock);
-    allow_new_conns = true;
-    pthread_mutex_unlock(&conn_lock);
+    if (c->sasl_conn) {
+        assert(settings.sasl);
+        sasl_dispose(&c->sasl_conn);
+        c->sasl_conn = NULL;
+    }
 
-    STATS_LOCK();
-    stats_state.curr_conns--;
-    STATS_UNLOCK();
+    MEMCACHED_CONN_RELEASE(c);
+
+    if (likely(IS_UDP(c->transport))) {
+        conn_set_state(c, conn_parse_cmd);
+        udp_spawn_data_release(c->spawn_data->release_data);
+        tcache_free(&udp_conn_tcache_pt, c);
+    } else {
+        conn_set_state(c, conn_read);
+        tcp_abort(c->tcp_conn);
+        tcp_close(c->tcp_conn);
+        tcache_free(&tcp_conn_tcache_pt, c);
+    }
 
     return;
 }
@@ -885,6 +915,7 @@ static const char *state_text(enum conn_states state) {
                                        "conn_mwrite",
                                        "conn_closed",
                                        "conn_watch" };
+
     return statenames[state];
 }
 
@@ -895,17 +926,16 @@ static const char *state_text(enum conn_states state) {
  */
 static void conn_set_state(conn *c, enum conn_states state) {
     assert(c != NULL);
-    assert(state >= conn_listening && state < conn_max_state);
 
     if (state != c->state) {
         if (settings.verbose > 2) {
-            fprintf(stderr, "%d: going from %s to %s\n",
-                    c->sfd, state_text(c->state),
+            fprintf(stderr, "%p: going from %s to %s\n",
+                    c, state_text(c->state),
                     state_text(state));
         }
 
         if (state == conn_write || state == conn_mwrite) {
-            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
+            MEMCACHED_PROCESS_COMMAND_END(c, c->wbuf, c->wbytes);
         }
         c->state = state;
     }
@@ -1085,14 +1115,14 @@ static void out_string(conn *c, const char *str) {
 
     if (c->noreply) {
         if (settings.verbose > 1)
-            fprintf(stderr, ">%d NOREPLY %s\n", c->sfd, str);
+            fprintf(stderr, ">%p NOREPLY %s\n", c, str);
         c->noreply = false;
         conn_set_state(c, conn_new_cmd);
         return;
     }
 
     if (settings.verbose > 1)
-        fprintf(stderr, ">%d %s\n", c->sfd, str);
+        fprintf(stderr, ">%p %s\n", c, str);
 
     /* Nuke a partial output... */
     c->msgcurr = 0;
@@ -1148,9 +1178,9 @@ static void complete_nread_ascii(conn *c) {
     enum store_item_type ret;
     bool is_valid = false;
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    STATS_LOCAL_LOCK();
+    mythr()->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    STATS_LOCAL_UNLOCK();
 
     if ((it->it_flags & ITEM_CHUNKED) == 0) {
         if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) == 0) {
@@ -1176,7 +1206,7 @@ static void complete_nread_ascii(conn *c) {
         if (strncmp(buf, "\r\n", 2) == 0) {
             is_valid = true;
         } else {
-            assert(1 == 0);
+            BUG();
         }
     }
 
@@ -1189,27 +1219,27 @@ static void complete_nread_ascii(conn *c) {
       uint64_t cas = ITEM_get_cas(it);
       switch (c->cmd) {
       case NREAD_ADD:
-          MEMCACHED_COMMAND_ADD(c->sfd, ITEM_key(it), it->nkey,
+          MEMCACHED_COMMAND_ADD(c, ITEM_key(it), it->nkey,
                                 (ret == 1) ? it->nbytes : -1, cas);
           break;
       case NREAD_REPLACE:
-          MEMCACHED_COMMAND_REPLACE(c->sfd, ITEM_key(it), it->nkey,
+          MEMCACHED_COMMAND_REPLACE(c, ITEM_key(it), it->nkey,
                                     (ret == 1) ? it->nbytes : -1, cas);
           break;
       case NREAD_APPEND:
-          MEMCACHED_COMMAND_APPEND(c->sfd, ITEM_key(it), it->nkey,
+          MEMCACHED_COMMAND_APPEND(c, ITEM_key(it), it->nkey,
                                    (ret == 1) ? it->nbytes : -1, cas);
           break;
       case NREAD_PREPEND:
-          MEMCACHED_COMMAND_PREPEND(c->sfd, ITEM_key(it), it->nkey,
+          MEMCACHED_COMMAND_PREPEND(c, ITEM_key(it), it->nkey,
                                     (ret == 1) ? it->nbytes : -1, cas);
           break;
       case NREAD_SET:
-          MEMCACHED_COMMAND_SET(c->sfd, ITEM_key(it), it->nkey,
+          MEMCACHED_COMMAND_SET(c, ITEM_key(it), it->nkey,
                                 (ret == 1) ? it->nbytes : -1, cas);
           break;
       case NREAD_CAS:
-          MEMCACHED_COMMAND_CAS(c->sfd, ITEM_key(it), it->nkey, it->nbytes,
+          MEMCACHED_COMMAND_CAS(c, ITEM_key(it), it->nkey, it->nbytes,
                                 cas);
           break;
       }
@@ -1289,10 +1319,10 @@ static void add_bin_header(conn *c, uint16_t err, uint8_t hdr_len, uint16_t key_
 
     if (settings.verbose > 1) {
         int ii;
-        fprintf(stderr, ">%d Writing bin response:", c->sfd);
+        fprintf(stderr, ">%p Writing bin response:", c);
         for (ii = 0; ii < sizeof(header->bytes); ++ii) {
             if (ii % 4 == 0) {
-                fprintf(stderr, "\n>%d  ", c->sfd);
+                fprintf(stderr, "\n>%p  ", c);
             }
             fprintf(stderr, " 0x%02x", header->bytes[ii]);
         }
@@ -1341,14 +1371,14 @@ static void write_bin_error(conn *c, protocol_binary_response_status err,
             errstr = "Auth failure.";
             break;
         default:
-            assert(false);
             errstr = "UNHANDLED ERROR";
-            fprintf(stderr, ">%d UNHANDLED ERROR: %d\n", c->sfd, err);
+            fprintf(stderr, ">%p UNHANDLED ERROR: %d\n", c, err);
+            BUG();
         }
     }
 
     if (settings.verbose > 1) {
-        fprintf(stderr, ">%d Writing an error: %s\n", c->sfd, errstr);
+        fprintf(stderr, ">%p Writing an error: %s\n", c, errstr);
     }
 
     len = strlen(errstr);
@@ -1462,13 +1492,13 @@ static void complete_incr_bin(conn *c) {
                         "SERVER_ERROR Out of memory allocating new item");
             }
         } else {
-            pthread_mutex_lock(&c->thread->stats.mutex);
+            STATS_LOCAL_LOCK();
             if (c->cmd == PROTOCOL_BINARY_CMD_INCREMENT) {
-                c->thread->stats.incr_misses++;
+                mythr()->stats.incr_misses++;
             } else {
-                c->thread->stats.decr_misses++;
+                mythr()->stats.decr_misses++;
             }
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            STATS_LOCAL_UNLOCK();
 
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
         }
@@ -1486,9 +1516,9 @@ static void complete_update_bin(conn *c) {
 
     item *it = c->item;
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    STATS_LOCAL_LOCK();
+    mythr()->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    STATS_LOCAL_UNLOCK();
 
     /* We don't actually receive the trailing two characters in the bin
      * protocol, so we're going to just set them here */
@@ -1512,23 +1542,23 @@ static void complete_update_bin(conn *c) {
     uint64_t cas = ITEM_get_cas(it);
     switch (c->cmd) {
     case NREAD_ADD:
-        MEMCACHED_COMMAND_ADD(c->sfd, ITEM_key(it), it->nkey,
+        MEMCACHED_COMMAND_ADD(c, ITEM_key(it), it->nkey,
                               (ret == STORED) ? it->nbytes : -1, cas);
         break;
     case NREAD_REPLACE:
-        MEMCACHED_COMMAND_REPLACE(c->sfd, ITEM_key(it), it->nkey,
+        MEMCACHED_COMMAND_REPLACE(c, ITEM_key(it), it->nkey,
                                   (ret == STORED) ? it->nbytes : -1, cas);
         break;
     case NREAD_APPEND:
-        MEMCACHED_COMMAND_APPEND(c->sfd, ITEM_key(it), it->nkey,
+        MEMCACHED_COMMAND_APPEND(c, ITEM_key(it), it->nkey,
                                  (ret == STORED) ? it->nbytes : -1, cas);
         break;
     case NREAD_PREPEND:
-        MEMCACHED_COMMAND_PREPEND(c->sfd, ITEM_key(it), it->nkey,
+        MEMCACHED_COMMAND_PREPEND(c, ITEM_key(it), it->nkey,
                                  (ret == STORED) ? it->nbytes : -1, cas);
         break;
     case NREAD_SET:
-        MEMCACHED_COMMAND_SET(c->sfd, ITEM_key(it), it->nkey,
+        MEMCACHED_COMMAND_SET(c, ITEM_key(it), it->nkey,
                               (ret == STORED) ? it->nbytes : -1, cas);
         break;
     }
@@ -1592,7 +1622,7 @@ static void process_bin_get_or_touch(conn *c) {
     bool failed = false;
 
     if (settings.verbose > 1) {
-        fprintf(stderr, "<%d %s ", c->sfd, should_touch ? "TOUCH" : "GET");
+        fprintf(stderr, "<%p %s ", c, should_touch ? "TOUCH" : "GET");
         if (fwrite(key, 1, nkey, stderr)) {}
         fputc('\n', stderr);
     }
@@ -1611,21 +1641,21 @@ static void process_bin_get_or_touch(conn *c) {
         uint16_t keylen = 0;
         uint32_t bodylen = sizeof(rsp->message.body) + (it->nbytes - 2);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
         if (should_touch) {
-            c->thread->stats.touch_cmds++;
-            c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+            mythr()->stats.touch_cmds++;
+            mythr()->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
         } else {
-            c->thread->stats.get_cmds++;
-            c->thread->stats.lru_hits[it->slabs_clsid]++;
+            mythr()->stats.get_cmds++;
+            mythr()->stats.lru_hits[it->slabs_clsid]++;
         }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_UNLOCK();
 
         if (should_touch) {
-            MEMCACHED_COMMAND_TOUCH(c->sfd, ITEM_key(it), it->nkey,
+            MEMCACHED_COMMAND_TOUCH(c, ITEM_key(it), it->nkey,
                                     it->nbytes, ITEM_get_cas(it));
         } else {
-            MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+            MEMCACHED_COMMAND_GET(c, ITEM_key(it), it->nkey,
                                   it->nbytes, ITEM_get_cas(it));
         }
 
@@ -1702,20 +1732,20 @@ static void process_bin_get_or_touch(conn *c) {
     }
 
     if (failed) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
         if (should_touch) {
-            c->thread->stats.touch_cmds++;
-            c->thread->stats.touch_misses++;
+            mythr()->stats.touch_cmds++;
+            mythr()->stats.touch_misses++;
         } else {
-            c->thread->stats.get_cmds++;
-            c->thread->stats.get_misses++;
+            mythr()->stats.get_cmds++;
+            mythr()->stats.get_misses++;
         }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_UNLOCK();
 
         if (should_touch) {
-            MEMCACHED_COMMAND_TOUCH(c->sfd, key, nkey, -1, 0);
+            MEMCACHED_COMMAND_TOUCH(c, key, nkey, -1, 0);
         } else {
-            MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+            MEMCACHED_COMMAND_GET(c, key, nkey, -1, 0);
         }
 
         if (c->noreply) {
@@ -1849,7 +1879,7 @@ static void process_bin_stat(conn *c) {
 
     if (settings.verbose > 1) {
         int ii;
-        fprintf(stderr, "<%d STATS ", c->sfd);
+        fprintf(stderr, "<%p STATS ", c);
         for (ii = 0; ii < nkey; ++ii) {
             fprintf(stderr, "%c", subcommand[ii]);
         }
@@ -1928,8 +1958,8 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
 
         if (nsize != c->rsize) {
             if (settings.verbose > 1) {
-                fprintf(stderr, "%d: Need to grow buffer from %lu to %lu\n",
-                        c->sfd, (unsigned long)c->rsize, (unsigned long)nsize);
+                fprintf(stderr, "%p: Need to grow buffer from %lu to %lu\n",
+                        c, (unsigned long)c->rsize, (unsigned long)nsize);
             }
             char *newm = realloc(c->rbuf, nsize);
             if (newm == NULL) {
@@ -1937,8 +1967,8 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
                 stats.malloc_fails++;
                 STATS_UNLOCK();
                 if (settings.verbose) {
-                    fprintf(stderr, "%d: Failed to grow buffer.. closing connection\n",
-                            c->sfd);
+                    fprintf(stderr, "%p: Failed to grow buffer.. closing connection\n",
+                            c);
                 }
                 conn_set_state(c, conn_closing);
                 return;
@@ -1953,7 +1983,7 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
             memmove(c->rbuf, c->rcurr, c->rbytes);
             c->rcurr = c->rbuf;
             if (settings.verbose > 1) {
-                fprintf(stderr, "%d: Repack input buffer\n", c->sfd);
+                fprintf(stderr, "%p: Repack input buffer\n", c);
             }
         }
     }
@@ -1967,8 +1997,8 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
 static void handle_binary_protocol_error(conn *c) {
     write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, 0);
     if (settings.verbose) {
-        fprintf(stderr, "Protocol error (opcode %02x), close connection %d\n",
-                c->binary_header.request.opcode, c->sfd);
+        fprintf(stderr, "Protocol error (opcode %02x), close connection %p\n",
+                c->binary_header.request.opcode, c);
     }
     c->write_and_go = conn_closing;
 }
@@ -2112,7 +2142,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
                                   &out, &outlen);
         break;
     default:
-        assert(false); /* CMD should be one of the above */
+        BUG(); /* CMD should be one of the above */
         /* This code is pretty much impossible, but makes the compiler
            happier */
         if (settings.verbose) {
@@ -2132,9 +2162,9 @@ static void process_bin_complete_sasl_auth(conn *c) {
     case SASL_OK:
         c->authenticated = true;
         write_bin_response(c, "Authenticated", 0, 0, strlen("Authenticated"));
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.auth_cmds++;
+        STATS_LOCAL_UNLOCK();
         break;
     case SASL_CONTINUE:
         add_bin_header(c, PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE, 0, 0, outlen);
@@ -2148,10 +2178,10 @@ static void process_bin_complete_sasl_auth(conn *c) {
         if (settings.verbose)
             fprintf(stderr, "Unknown sasl response:  %d\n", result);
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        c->thread->stats.auth_errors++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.auth_cmds++;
+        mythr()->stats.auth_errors++;
+        STATS_LOCAL_UNLOCK();
     }
 }
 
@@ -2197,7 +2227,7 @@ static void dispatch_bin_command(conn *c) {
         return;
     }
 
-    MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
+    MEMCACHED_PROCESS_COMMAND_START(c, c->rcurr, c->rbytes);
     c->noreply = true;
 
     /* binprot supports 16bit keys, but internals are still 8bit */
@@ -2391,11 +2421,11 @@ static void process_bin_update(conn *c) {
     if (settings.verbose > 1) {
         int ii;
         if (c->cmd == PROTOCOL_BINARY_CMD_ADD) {
-            fprintf(stderr, "<%d ADD ", c->sfd);
+            fprintf(stderr, "<%p ADD ", c);
         } else if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
-            fprintf(stderr, "<%d SET ", c->sfd);
+            fprintf(stderr, "<%p SET ", c);
         } else {
-            fprintf(stderr, "<%d REPLACE ", c->sfd);
+            fprintf(stderr, "<%p REPLACE ", c);
         }
         for (ii = 0; ii < nkey; ++ii) {
             fprintf(stderr, "%c", key[ii]);
@@ -2424,7 +2454,7 @@ static void process_bin_update(conn *c) {
             status = NO_MEMORY;
         }
         /* FIXME: losing c->cmd since it's translated below. refactor? */
-        LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
+        LOGGER_LOG(mythr()->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
                 NULL, status, 0, key, nkey, req->message.body.expiration,
                 ITEM_clsid(it));
 
@@ -2434,7 +2464,7 @@ static void process_bin_update(conn *c) {
             it = item_get(key, nkey, c, DONT_UPDATE);
             if (it) {
                 item_unlink(it);
-                STORAGE_delete(c->thread->storage, it);
+                STORAGE_delete(mythr()->storage, it);
                 item_remove(it);
             }
         }
@@ -2457,7 +2487,7 @@ static void process_bin_update(conn *c) {
             c->cmd = NREAD_REPLACE;
             break;
         default:
-            assert(0);
+            BUG();
     }
 
     if (ITEM_get_cas(it) != 0) {
@@ -2516,7 +2546,7 @@ static void process_bin_append_prepend(conn *c) {
             c->cmd = NREAD_PREPEND;
             break;
         default:
-            assert(0);
+            BUG();
     }
 
     c->item = it;
@@ -2554,9 +2584,9 @@ static void process_bin_flush(conn *c) {
         settings.oldest_live = new_oldest;
     }
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.flush_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    STATS_LOCAL_LOCK();
+    mythr()->stats.flush_cmds++;
+    STATS_LOCAL_UNLOCK();
 
     write_bin_response(c, NULL, 0, 0, 0);
 }
@@ -2588,12 +2618,12 @@ static void process_bin_delete(conn *c) {
     if (it) {
         uint64_t cas = ntohll(req->message.header.request.cas);
         if (cas == 0 || cas == ITEM_get_cas(it)) {
-            MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            MEMCACHED_COMMAND_DELETE(c, ITEM_key(it), it->nkey);
+            STATS_LOCAL_LOCK();
+            mythr()->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+            STATS_LOCAL_UNLOCK();
             item_unlink(it);
-            STORAGE_delete(c->thread->storage, it);
+            STORAGE_delete(mythr()->storage, it);
             write_bin_response(c, NULL, 0, 0, 0);
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
@@ -2601,9 +2631,9 @@ static void process_bin_delete(conn *c) {
         item_remove(it);      /* release our reference */
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.delete_misses++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.delete_misses++;
+        STATS_LOCAL_UNLOCK();
     }
 }
 
@@ -2647,7 +2677,7 @@ static void complete_nread_binary(conn *c) {
         break;
     default:
         fprintf(stderr, "Not handling substate %d\n", c->substate);
-        assert(0);
+        BUG();
     }
 }
 
@@ -2661,8 +2691,10 @@ static void reset_cmd_handler(conn *c) {
     conn_shrink(c);
     if (c->rbytes > 0) {
         conn_set_state(c, conn_parse_cmd);
+    } else if (IS_UDP(c->transport)) {
+        conn_set_state(c, conn_closing);
     } else {
-        conn_set_state(c, conn_waiting);
+        conn_set_state(c, conn_read);
     }
 }
 
@@ -2802,25 +2834,25 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         if(old_it == NULL) {
             // LRU expired
             stored = NOT_FOUND;
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.cas_misses++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            STATS_LOCAL_LOCK();
+            mythr()->stats.cas_misses++;
+            STATS_LOCAL_UNLOCK();
         }
         else if (ITEM_get_cas(it) == ITEM_get_cas(old_it)) {
             // cas validates
             // it and old_it may belong to different classes.
             // I'm updating the stats for the one that's getting pushed out
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            STATS_LOCAL_LOCK();
+            mythr()->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+            STATS_LOCAL_UNLOCK();
 
-            STORAGE_delete(c->thread->storage, old_it);
+            STORAGE_delete(mythr()->storage, old_it);
             item_replace(old_it, it, hv);
             stored = STORED;
         } else {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            STATS_LOCAL_LOCK();
+            mythr()->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
+            STATS_LOCAL_UNLOCK();
 
             if(settings.verbose > 1) {
                 fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
@@ -2883,7 +2915,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 
         if (stored == NOT_STORED && failed_alloc == 0) {
             if (old_it != NULL) {
-                STORAGE_delete(c->thread->storage, old_it);
+                STORAGE_delete(mythr()->storage, old_it);
                 item_replace(old_it, it, hv);
             } else {
                 do_item_link(it, hv);
@@ -2903,7 +2935,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
     if (stored == STORED) {
         c->cas = ITEM_get_cas(it);
     }
-    LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
+    LOGGER_LOG(mythr()->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
             stored, comm, ITEM_key(it), it->nkey, it->exptime, ITEM_clsid(it));
 
     return stored;
@@ -3074,7 +3106,6 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("uptime", "%u", now - ITEM_UPDATE_INTERVAL);
     APPEND_STAT("time", "%ld", now + (long)process_started);
     APPEND_STAT("version", "%s", VERSION);
-    APPEND_STAT("libevent", "%s", event_get_version());
     APPEND_STAT("pointer_size", "%d", (int)(8 * sizeof(void *)));
 
 #ifndef WIN32
@@ -3256,6 +3287,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
 #endif
 }
 
+#if 0
 static void conn_to_str(const conn *c, char *buf) {
     char addr_text[MAXPATHLEN];
 
@@ -3333,8 +3365,10 @@ static void conn_to_str(const conn *c, char *buf) {
         }
     }
 }
+#endif
 
 static void process_stats_conns(ADD_STAT add_stats, void *c) {
+#if 0
     int i;
     char key_str[STAT_KEY_LEN];
     char val_str[STAT_VAL_LEN];
@@ -3361,6 +3395,7 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
             }
         }
     }
+#endif
 }
 #ifdef EXTSTORE
 static void process_extstore_stats(ADD_STAT add_stats, conn *c) {
@@ -3549,7 +3584,7 @@ static inline char *_ascii_get_suffix_buf(conn *c, int i) {
     }
     }
 
-    suffix = do_cache_alloc(c->thread->suffix_cache);
+    suffix = do_cache_alloc(mythr()->suffix_cache);
     if (suffix == NULL) {
       STATS_LOCK();
       stats.malloc_fails++;
@@ -3799,7 +3834,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 while (i-- > 0) {
                     item_remove(*(c->ilist + i));
                     if (return_cas || !settings.inline_ascii_response) {
-                        do_cache_free(c->thread->suffix_cache, *(c->suffixlist + i));
+                        do_cache_free(mythr()->suffix_cache, *(c->suffixlist + i));
                     }
                 }
                 return;
@@ -3825,7 +3860,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
                 if (return_cas || !settings.inline_ascii_response)
                 {
-                  MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                  MEMCACHED_COMMAND_GET(c, ITEM_key(it), it->nkey,
                                         it->nbytes, ITEM_get_cas(it));
                   int nbytes;
                   suffix = _ascii_get_suffix_buf(c, si);
@@ -3862,7 +3897,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 }
                 else
                 {
-                  MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                  MEMCACHED_COMMAND_GET(c, ITEM_key(it), it->nkey,
                                         it->nbytes, ITEM_get_cas(it));
                   if (add_iov(c, "VALUE ", 6) != 0 ||
                       add_iov(c, ITEM_key(it), it->nkey) != 0)
@@ -3887,7 +3922,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
                 if (settings.verbose > 1) {
                     int ii;
-                    fprintf(stderr, ">%d sending key ", c->sfd);
+                    fprintf(stderr, ">%p sending key ", c);
                     for (ii = 0; ii < it->nkey; ++ii) {
                         fprintf(stderr, "%c", key[ii]);
                     }
@@ -3895,15 +3930,15 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 }
 
                 /* item_get() has incremented it->refcount for us */
-                pthread_mutex_lock(&c->thread->stats.mutex);
+                STATS_LOCAL_LOCK();
                 if (should_touch) {
-                    c->thread->stats.touch_cmds++;
-                    c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+                    mythr()->stats.touch_cmds++;
+                    mythr()->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
                 } else {
-                    c->thread->stats.lru_hits[it->slabs_clsid]++;
-                    c->thread->stats.get_cmds++;
+                    mythr()->stats.lru_hits[it->slabs_clsid]++;
+                    mythr()->stats.get_cmds++;
                 }
-                pthread_mutex_unlock(&c->thread->stats.mutex);
+                STATS_LOCAL_UNLOCK();
 #ifdef EXTSTORE
                 /* If ITEM_HDR, an io_wrap owns the reference. */
                 if ((it->it_flags & ITEM_HDR) == 0) {
@@ -3915,16 +3950,16 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 i++;
 #endif
             } else {
-                pthread_mutex_lock(&c->thread->stats.mutex);
+                STATS_LOCAL_LOCK();
                 if (should_touch) {
-                    c->thread->stats.touch_cmds++;
-                    c->thread->stats.touch_misses++;
+                    mythr()->stats.touch_cmds++;
+                    mythr()->stats.touch_misses++;
                 } else {
-                    c->thread->stats.get_misses++;
-                    c->thread->stats.get_cmds++;
+                    mythr()->stats.get_misses++;
+                    mythr()->stats.get_cmds++;
                 }
-                MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
-                pthread_mutex_unlock(&c->thread->stats.mutex);
+                MEMCACHED_COMMAND_GET(c, key, nkey, -1, 0);
+                STATS_LOCAL_UNLOCK();
             }
 
             key_token++;
@@ -3949,7 +3984,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
     }
 
     if (settings.verbose > 1)
-        fprintf(stderr, ">%d END\n", c->sfd);
+        fprintf(stderr, ">%p END\n", c);
 
     /*
         If the loop was terminated because of out-of-memory, it is not
@@ -4033,7 +4068,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             out_of_memory(c, "SERVER_ERROR out of memory storing object");
             status = NO_MEMORY;
         }
-        LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
+        LOGGER_LOG(mythr()->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
                 NULL, status, comm, key, nkey, 0, 0);
         /* swallow the data line */
         c->write_and_go = conn_swallow;
@@ -4045,7 +4080,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             it = item_get(key, nkey, c, DONT_UPDATE);
             if (it) {
                 item_unlink(it);
-                STORAGE_delete(c->thread->storage, it);
+                STORAGE_delete(mythr()->storage, it);
                 item_remove(it);
             }
         }
@@ -4086,18 +4121,18 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
 
     it = item_touch(key, nkey, realtime(exptime_int), c);
     if (it) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.touch_cmds++;
-        c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.touch_cmds++;
+        mythr()->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+        STATS_LOCAL_UNLOCK();
 
         out_string(c, "TOUCHED");
         item_remove(it);
     } else {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.touch_cmds++;
-        c->thread->stats.touch_misses++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.touch_cmds++;
+        mythr()->stats.touch_misses++;
+        STATS_LOCAL_UNLOCK();
 
         out_string(c, "NOT_FOUND");
     }
@@ -4137,13 +4172,13 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         out_of_memory(c, "SERVER_ERROR out of memory");
         break;
     case DELTA_ITEM_NOT_FOUND:
-        pthread_mutex_lock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
         if (incr) {
-            c->thread->stats.incr_misses++;
+            mythr()->stats.incr_misses++;
         } else {
-            c->thread->stats.decr_misses++;
+            mythr()->stats.decr_misses++;
         }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_UNLOCK();
 
         out_string(c, "NOT_FOUND");
         break;
@@ -4201,23 +4236,23 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     if (incr) {
         value += delta;
-        MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
+        MEMCACHED_COMMAND_INCR(c, ITEM_key(it), it->nkey, value);
     } else {
         if(delta > value) {
             value = 0;
         } else {
             value -= delta;
         }
-        MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
+        MEMCACHED_COMMAND_DECR(c, ITEM_key(it), it->nkey, value);
     }
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
+    STATS_LOCAL_LOCK();
     if (incr) {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
+        mythr()->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
     } else {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
+        mythr()->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
     }
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    STATS_LOCAL_UNLOCK();
 
     snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
     res = strlen(buf);
@@ -4310,20 +4345,20 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
 
     it = item_get(key, nkey, c, DONT_UPDATE);
     if (it) {
-        MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
+        MEMCACHED_COMMAND_DELETE(c, ITEM_key(it), it->nkey);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+        STATS_LOCAL_UNLOCK();
 
         item_unlink(it);
-        STORAGE_delete(c->thread->storage, it);
+        STORAGE_delete(mythr()->storage, it);
         item_remove(it);      /* release our reference */
         out_string(c, "DELETED");
     } else {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.delete_misses++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.delete_misses++;
+        STATS_LOCAL_UNLOCK();
 
         out_string(c, "NOT_FOUND");
     }
@@ -4424,7 +4459,7 @@ static void process_watch_command(conn *c, token_t *tokens, const size_t ntokens
         f |= LOG_FETCHERS;
     }
 
-    switch(logger_add_watcher(c, c->sfd, f)) {
+    switch(logger_add_watcher(c, f)) {
         case LOGGER_ADD_WATCHER_TOO_MANY:
             out_string(c, "WATCHER_TOO_MANY log watcher limit reached");
             break;
@@ -4433,7 +4468,6 @@ static void process_watch_command(conn *c, token_t *tokens, const size_t ntokens
             break;
         case LOGGER_ADD_WATCHER_OK:
             conn_set_state(c, conn_watch);
-            event_del(&c->event);
             break;
     }
 }
@@ -4587,10 +4621,11 @@ static void process_command(conn *c, char *command) {
 
     assert(c != NULL);
 
-    MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
+    MEMCACHED_PROCESS_COMMAND_START(c, c->rcurr, c->rbytes);
 
     if (settings.verbose > 1)
-        fprintf(stderr, "<%d %s\n", c->sfd, command);
+        fprintf(stderr, "<%p %s\n", c, command);
+
 
     /*
      * for commands set/add/replace, we build an item and read the data
@@ -4663,9 +4698,9 @@ static void process_command(conn *c, char *command) {
 
         set_noreply_maybe(c, tokens, ntokens);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.flush_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+        STATS_LOCAL_LOCK();
+        mythr()->stats.flush_cmds++;
+        STATS_LOCAL_UNLOCK();
 
         if (!settings.flush_enabled) {
             // flush_all is not allowed but we log it on stats
@@ -4770,7 +4805,7 @@ static void process_command(conn *c, char *command) {
                 return;
             }
 
-            rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
+            rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL,
                     settings.lru_crawler_tocrawl);
             switch(rv) {
             case CRAWLER_OK:
@@ -4801,13 +4836,12 @@ static void process_command(conn *c, char *command) {
             }
 
             int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
-                    c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
+                    c, LRU_CRAWLER_CAP_REMAINING);
             switch(rv) {
                 case CRAWLER_OK:
                     out_string(c, "OK");
                     // TODO: Don't reuse conn_watch here.
                     conn_set_state(c, conn_watch);
-                    event_del(&c->event);
                     break;
                 case CRAWLER_RUNNING:
                     out_string(c, "BUSY currently processing crawler request");
@@ -4908,7 +4942,7 @@ static int try_read_command(conn *c) {
         }
 
         if (settings.verbose > 1) {
-            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+            fprintf(stderr, "%p: Client using the %s protocol\n", c,
                     prot_text(c->protocol));
         }
     }
@@ -4925,7 +4959,7 @@ static int try_read_command(conn *c) {
                 memmove(c->rbuf, c->rcurr, c->rbytes);
                 c->rcurr = c->rbuf;
                 if (settings.verbose > 1) {
-                    fprintf(stderr, "%d: Realign input buffer\n", c->sfd);
+                    fprintf(stderr, "%p: Realign input buffer\n", c);
                 }
             }
 #endif
@@ -4935,10 +4969,10 @@ static int try_read_command(conn *c) {
             if (settings.verbose > 1) {
                 /* Dump the packet before we convert it to host order */
                 int ii;
-                fprintf(stderr, "<%d Read binary protocol data:", c->sfd);
+                fprintf(stderr, "<%p Read binary protocol data:", c);
                 for (ii = 0; ii < sizeof(req->bytes); ++ii) {
                     if (ii % 4 == 0) {
-                        fprintf(stderr, "\n<%d   ", c->sfd);
+                        fprintf(stderr, "\n<%p   ", c);
                     }
                     fprintf(stderr, " 0x%02x", req->bytes[ii]);
                 }
@@ -5027,6 +5061,7 @@ static int try_read_command(conn *c) {
     return 1;
 }
 
+#if 0
 /*
  * read a UDP request.
  */
@@ -5064,6 +5099,7 @@ static enum try_read_result try_read_udp(conn *c) {
     }
     return READ_NO_DATA_RECEIVED;
 }
+#endif
 
 /*
  * read from network as much as we can, handle buffer overflow and connection
@@ -5079,7 +5115,7 @@ static enum try_read_result try_read_udp(conn *c) {
  */
 static enum try_read_result try_read_network(conn *c) {
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
-    int res;
+    ssize_t res;
     int num_allocs = 0;
     assert(c != NULL);
 
@@ -5111,13 +5147,12 @@ static enum try_read_result try_read_network(conn *c) {
             c->rcurr = c->rbuf = new_rbuf;
             c->rsize *= 2;
         }
-
         int avail = c->rsize - c->rbytes;
-        res = read(c->sfd, c->rbuf + c->rbytes, avail);
+        res = tcp_read(c->tcp_conn, c->rbuf + c->rbytes, avail);
         if (res > 0) {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.bytes_read += res;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            STATS_LOCAL_LOCK();
+            mythr()->stats.bytes_read += res;
+            STATS_LOCAL_UNLOCK();
             gotdata = READ_DATA_RECEIVED;
             c->rbytes += res;
             if (res == avail) {
@@ -5126,7 +5161,7 @@ static enum try_read_result try_read_network(conn *c) {
                 break;
             }
         }
-        if (res == 0) {
+        if (res <= 0) {
             return READ_ERROR;
         }
         if (res == -1) {
@@ -5139,6 +5174,7 @@ static enum try_read_result try_read_network(conn *c) {
     return gotdata;
 }
 
+#if 0
 static bool update_event(conn *c, const int new_flags) {
     assert(c != NULL);
 
@@ -5195,6 +5231,7 @@ void do_accept_new_conns(const bool do_accept) {
         maxconns_handler(-42, 0, 0);
     }
 }
+#endif
 
 /*
  * Transmit the next chunk of data from our list of msgbuf structures.
@@ -5216,12 +5253,14 @@ static enum transmit_result transmit(conn *c) {
     if (c->msgcurr < c->msgused) {
         ssize_t res;
         struct msghdr *m = &c->msglist[c->msgcurr];
-
-        res = sendmsg(c->sfd, m, 0);
+        if (IS_UDP(c->transport))
+            res = udp_respondv(m->msg_iov, m->msg_iovlen, c->spawn_data);
+        else
+            res = tcp_writev(c->tcp_conn, m->msg_iov, m->msg_iovlen);
         if (res > 0) {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.bytes_written += res;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            STATS_LOCAL_LOCK();
+            mythr()->stats.bytes_written += res;
+            STATS_LOCAL_UNLOCK();
 
             /* We've written some of the data. Remove the completed
                iovec entries from the list of pending writes. */
@@ -5239,24 +5278,11 @@ static enum transmit_result transmit(conn *c) {
             }
             return TRANSMIT_INCOMPLETE;
         }
-        if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-                if (settings.verbose > 0)
-                    fprintf(stderr, "Couldn't update event\n");
-                conn_set_state(c, conn_closing);
-                return TRANSMIT_HARD_ERROR;
-            }
-            return TRANSMIT_SOFT_ERROR;
-        }
-        /* if res == 0 or res == -1 and error is not EAGAIN or EWOULDBLOCK,
-           we have a real error, on which we close the connection */
-        if (settings.verbose > 0)
-            perror("Failed to write, and not due to blocking");
 
-        if (IS_UDP(c->transport))
-            conn_set_state(c, conn_read);
-        else
-            conn_set_state(c, conn_closing);
+        if (res == -105)
+            return TRANSMIT_SOFT_ERROR;
+
+        conn_set_state(c, conn_closing);
         return TRANSMIT_HARD_ERROR;
     } else {
         return TRANSMIT_COMPLETE;
@@ -5313,12 +5339,16 @@ static int read_into_chunked_item(conn *c) {
             }
         } else {
             /*  now try reading from the socket */
-            res = read(c->sfd, ch->data + ch->used,
-                    (unused > c->rlbytes ? c->rlbytes : unused));
+            if (IS_UDP(c->transport)) {
+                res = 0;
+            } else {
+                res = tcp_read(c->tcp_conn, ch->data + ch->used,
+                                    (unused > c->rlbytes ? c->rlbytes : unused));
+            }
             if (res > 0) {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.bytes_read += res;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
+                STATS_LOCAL_LOCK();
+                mythr()->stats.bytes_read += res;
+                STATS_LOCAL_UNLOCK();
                 ch->used += res;
                 total += res;
                 c->rlbytes -= res;
@@ -5347,19 +5377,11 @@ static int read_into_chunked_item(conn *c) {
     return total;
 }
 
-static void drive_machine(conn *c) {
+void drive_machine(void *arg) {
+    conn *c = arg;
     bool stop = false;
-    int sfd;
-    socklen_t addrlen;
-    struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
     int res;
-    const char *str;
-#ifdef HAVE_ACCEPT4
-    static int  use_accept4 = 1;
-#else
-    static int  use_accept4 = 0;
-#endif
 
     assert(c != NULL);
 
@@ -5367,6 +5389,8 @@ static void drive_machine(conn *c) {
 
         switch(c->state) {
         case conn_listening:
+            BUG();
+#if 0
             addrlen = sizeof(addr);
 #ifdef HAVE_ACCEPT4
             if (use_accept4) {
@@ -5420,8 +5444,11 @@ static void drive_machine(conn *c) {
 
             stop = true;
             break;
+#endif
 
         case conn_waiting:
+            BUG();
+#if 0
             if (!update_event(c, EV_READ | EV_PERSIST)) {
                 if (settings.verbose > 0)
                     fprintf(stderr, "Couldn't update event\n");
@@ -5432,13 +5459,13 @@ static void drive_machine(conn *c) {
             conn_set_state(c, conn_read);
             stop = true;
             break;
+#endif
 
         case conn_read:
-            res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
-
+            BUG_ON(IS_UDP(c->transport));
+            res = try_read_network(c);
             switch (res) {
             case READ_NO_DATA_RECEIVED:
-                conn_set_state(c, conn_waiting);
                 break;
             case READ_DATA_RECEIVED:
                 conn_set_state(c, conn_parse_cmd);
@@ -5455,7 +5482,10 @@ static void drive_machine(conn *c) {
         case conn_parse_cmd :
             if (try_read_command(c) == 0) {
                 /* wee need more data! */
-                conn_set_state(c, conn_waiting);
+                if (IS_UDP(c->transport))
+                    conn_set_state(c, conn_closing);
+                else
+                    conn_set_state(c, conn_read);
             }
 
             break;
@@ -5468,24 +5498,11 @@ static void drive_machine(conn *c) {
             if (nreqs >= 0) {
                 reset_cmd_handler(c);
             } else {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.conn_yields++;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                if (c->rbytes > 0) {
-                    /* We have already read in data into the input buffer,
-                       so libevent will most likely not signal read events
-                       on the socket (unless more data is available. As a
-                       hack we should just put in a request to write data,
-                       because that should be possible ;-)
-                    */
-                    if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-                        if (settings.verbose > 0)
-                            fprintf(stderr, "Couldn't update event\n");
-                        conn_set_state(c, conn_closing);
-                        break;
-                    }
-                }
-                stop = true;
+                STATS_LOCAL_LOCK();
+                mythr()->stats.conn_yields++;
+                STATS_LOCAL_UNLOCK();
+                thread_yield();
+                nreqs = settings.reqs_per_event;
             }
             break;
 
@@ -5519,13 +5536,16 @@ static void drive_machine(conn *c) {
                         break;
                     }
                 }
-
                 /*  now try reading from the socket */
-                res = read(c->sfd, c->ritem, c->rlbytes);
+                if (IS_UDP(c->transport)) {
+                    res = 0;
+                } else {
+                    res = tcp_read(c->tcp_conn, c->ritem, c->rlbytes);
+                }
                 if (res > 0) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.bytes_read += res;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    STATS_LOCAL_LOCK();
+                    mythr()->stats.bytes_read += res;
+                    STATS_LOCAL_UNLOCK();
                     if (c->rcurr == c->ritem) {
                         c->rcurr += res;
                     }
@@ -5545,13 +5565,6 @@ static void drive_machine(conn *c) {
             }
 
             if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                stop = true;
                 break;
             }
 
@@ -5590,32 +5603,6 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            /*  now try reading from the socket */
-            res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
-            if (res > 0) {
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.bytes_read += res;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                c->sbytes -= res;
-                break;
-            }
-            if (res == 0) { /* end of stream */
-                conn_set_state(c, conn_closing);
-                break;
-            }
-            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (!update_event(c, EV_READ | EV_PERSIST)) {
-                    if (settings.verbose > 0)
-                        fprintf(stderr, "Couldn't update event\n");
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                stop = true;
-                break;
-            }
-            /* otherwise we have a real error, on which we close the connection */
-            if (settings.verbose > 0)
-                fprintf(stderr, "Failed to read, and not due to blocking\n");
             conn_set_state(c, conn_closing);
             break;
 
@@ -5683,42 +5670,95 @@ static void drive_machine(conn *c) {
                 }
                 break;
 
+            case TRANSMIT_SOFT_ERROR:
+                thread_yield();
+                break;
+
             case TRANSMIT_INCOMPLETE:
             case TRANSMIT_HARD_ERROR:
                 break;                   /* Continue in state machine. */
-
-            case TRANSMIT_SOFT_ERROR:
-                stop = true;
-                break;
             }
             break;
 
         case conn_closing:
-            if (IS_UDP(c->transport))
-                conn_cleanup(c);
-            else
-                conn_close(c);
             stop = true;
             break;
 
         case conn_closed:
             /* This only happens if dormando is an idiot. */
-            abort();
+            BUG();
             break;
 
         case conn_watch:
             /* We handed off our connection to the logger thread. */
             stop = true;
-            break;
+            return;
+
         case conn_max_state:
-            assert(false);
+            BUG();
             break;
         }
     }
 
+    BUG_ON(c->state != conn_closing);
+    conn_close(c);
+
     return;
 }
 
+static void handle_tcp_conn(void *arg)
+{
+    tcpconn_t *tconn = arg;
+    conn *c = tcache_alloc(&tcp_conn_tcache_pt);
+    if (!c) {
+        tcp_abort(tconn);
+        tcp_close(tconn);
+        return;
+    }
+
+    c->tcp_conn = tconn;
+    drive_machine(c);
+}
+
+static void udp_handler(struct udp_spawn_data *d) {
+    conn *c;
+
+    size_t res = d->len;
+
+    if (res <= 8 || (c = tcache_alloc(&udp_conn_tcache_pt)) == NULL) {
+        udp_spawn_data_release(d->release_data);
+        return;
+    }
+
+    c->spawn_data = d;
+
+    BUG_ON(res > c->rsize);
+    memcpy(c->rbuf, d->buf, res);
+
+    unsigned char *buf = (unsigned char *)c->rbuf;
+    STATS_LOCAL_LOCK();
+    mythr()->stats.bytes_read += res;
+    STATS_LOCAL_UNLOCK();
+
+    /* Beginning of UDP packet is the request ID; save it. */
+    c->request_id = buf[0] * 256 + buf[1];
+
+    /* If this is a multi-packet request, drop it. */
+    if (buf[4] != 0 || buf[5] != 1) {
+        out_string(c, "SERVER_ERROR multi-packet request not supported");
+    }
+
+    /* Don't care about any of the rest of the header. */
+    res -= 8;
+    memmove(c->rbuf, c->rbuf + 8, res);
+
+    c->rbytes = res;
+    c->rcurr = c->rbuf;
+
+    drive_machine(c);
+}
+
+#if 0
 void event_handler(const int fd, const short which, void *arg) {
     conn *c;
 
@@ -6089,6 +6129,7 @@ static int server_socket_unix(const char *path, int access_mask) {
 
     return 0;
 }
+#endif
 
 /*
  * We keep the current time of day in a global variable that's updated by a
@@ -6099,27 +6140,17 @@ static int server_socket_unix(const char *path, int access_mask) {
  * sizeof(time_t) > sizeof(unsigned int).
  */
 volatile rel_time_t current_time;
-static struct event clockevent;
 
 /* libevent uses a monotonic clock when available for event scheduling. Aside
  * from jitter, simply ticking our internal timer here is accurate enough.
  * Note that users who are setting explicit dates for expiration times *must*
  * ensure their clocks are correct before starting memcached. */
-static void clock_handler(const int fd, const short which, void *arg) {
-    struct timeval t = {.tv_sec = 1, .tv_usec = 0};
-    static bool initialized = false;
+static void clock_thread(void *arg) {
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
     static bool monotonic = false;
     static time_t monotonic_start;
 #endif
 
-    if (initialized) {
-        /* only delete the event if it's actually there. */
-        evtimer_del(&clockevent);
-    } else {
-        initialized = true;
-        /* process_started is initialized to time() - 2. We initialize to 1 so
-         * flush_all won't underflow during tests. */
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
         struct timespec ts;
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
@@ -6127,29 +6158,23 @@ static void clock_handler(const int fd, const short which, void *arg) {
             monotonic_start = ts.tv_sec - ITEM_UPDATE_INTERVAL - 2;
         }
 #endif
-    }
 
-    // While we're here, check for hash table expansion.
-    // This function should be quick to avoid delaying the timer.
-    assoc_start_expand(stats_state.curr_items);
-
-    evtimer_set(&clockevent, clock_handler, 0);
-    event_base_set(main_base, &clockevent);
-    evtimer_add(&clockevent, &t);
-
+    while (1) {
+        timer_sleep(ONE_SECOND);
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    if (monotonic) {
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
-            return;
-        current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
-        return;
-    }
+        if (monotonic) {
+            struct timespec ts;
+            if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+                continue;
+            current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
+            continue;
+        }
 #endif
-    {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        current_time = (rel_time_t) (tv.tv_sec - process_started);
+        {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            current_time = (rel_time_t) (tv.tv_sec - process_started);
+        }
     }
 }
 
@@ -6441,6 +6466,7 @@ static int enable_large_pages(void) {
 #endif
 }
 
+#if 0
 /**
  * Do basic sanity check of the runtime environment
  * @return true if no errors found, false if we can't use this env
@@ -6462,6 +6488,7 @@ static bool sanitycheck(void) {
 
     return true;
 }
+#endif
 
 static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
     char *b = NULL;
@@ -6501,37 +6528,39 @@ static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
     return true;
 }
 
-int main (int argc, char **argv) {
-    int c;
-    bool lock_memory = false;
-    bool do_daemonize = false;
-    bool preallocate = false;
-    int maxcore = 0;
-    char *username = NULL;
-    char *pid_file = NULL;
-    struct passwd *pw;
-    struct rlimit rlim;
-    char *buf;
-    char unit = '\0';
-    int size_max = 0;
-    int retval = EXIT_SUCCESS;
-    /* listening sockets */
-    static int *l_socket = NULL;
 
-    /* udp socket */
-    static int *u_socket = NULL;
-    bool protocol_specified = false;
-    bool tcp_specified = false;
-    bool udp_specified = false;
-    bool start_lru_maintainer = true;
-    bool start_lru_crawler = true;
-    bool start_assoc_maint = true;
-    enum hashfunc_type hash_type = MURMUR3_HASH;
+static bool lock_memory = false;
+static bool do_daemonize = false;
+static bool preallocate = false;
+static int maxcore = 0;
+static char *username = NULL;
+static char *pid_file = NULL;
+static struct passwd *pw;
+static struct rlimit rlim;
+static bool protocol_specified = false;
+static bool start_lru_maintainer = true;
+static bool start_lru_crawler = true;
+static bool start_assoc_maint = true;
+static enum hashfunc_type hash_type = MURMUR3_HASH;
+static char *slab_sizes_unparsed = NULL;
+static bool slab_chunk_size_changed = false;
+static bool use_slab_sizes = false;
+static uint32_t slab_sizes[MAX_NUMBER_OF_SLAB_CLASSES];
+
+
+
+static void arg_parse(void *arg)
+{
+    char **argv = arg;
+    int argc = 0;
+    for (; argv[argc]; argc++) ;
+
+    int c;
+    char *buf;
+    int size_max = 0;
+    char unit = '\0';
     uint32_t tocrawl;
-    uint32_t slab_sizes[MAX_NUMBER_OF_SLAB_CLASSES];
-    bool use_slab_sizes = false;
-    char *slab_sizes_unparsed = NULL;
-    bool slab_chunk_size_changed = false;
+
 #ifdef EXTSTORE
     void *storage = NULL;
     char *storage_file = NULL;
@@ -6655,6 +6684,7 @@ int main (int argc, char **argv) {
         NULL
     };
 
+#if 0
     if (!sanitycheck()) {
         return EX_OSERR;
     }
@@ -6690,6 +6720,7 @@ int main (int argc, char **argv) {
 
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
+#endif
 
     char *shortopts =
           "a:"  /* access mask for unix socket */
@@ -6776,14 +6807,11 @@ int main (int argc, char **argv) {
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
             break;
-
         case 'U':
             settings.udpport = atoi(optarg);
-            udp_specified = true;
             break;
         case 'p':
             settings.port = atoi(optarg);
-            tcp_specified = true;
             break;
         case 's':
             settings.socketpath = optarg;
@@ -6798,7 +6826,7 @@ int main (int argc, char **argv) {
             settings.maxconns = atoi(optarg);
             if (settings.maxconns <= 0) {
                 fprintf(stderr, "Maximum connections must be greater than 0\n");
-                return 1;
+                exit(1);
             }
             break;
         case 'h':
@@ -6825,7 +6853,7 @@ int main (int argc, char **argv) {
                 char *p = malloc(len);
                 if (p == NULL) {
                     fprintf(stderr, "Failed to allocate memory\n");
-                    return 1;
+                    exit(1);
                 }
                 snprintf(p, len, "%s,%s", settings.inter, optarg);
                 free(settings.inter);
@@ -6844,7 +6872,7 @@ int main (int argc, char **argv) {
             settings.reqs_per_event = atoi(optarg);
             if (settings.reqs_per_event == 0) {
                 fprintf(stderr, "Number of requests per event must be greater than 0\n");
-                return 1;
+                exit(1);
             }
             break;
         case 'u':
@@ -6857,21 +6885,21 @@ int main (int argc, char **argv) {
             settings.factor = atof(optarg);
             if (settings.factor <= 1.0) {
                 fprintf(stderr, "Factor must be greater than 1\n");
-                return 1;
+                exit(1);
             }
             break;
         case 'n':
             settings.chunk_size = atoi(optarg);
             if (settings.chunk_size == 0) {
                 fprintf(stderr, "Chunk size must be greater than 0\n");
-                return 1;
+                exit(1);
             }
             break;
         case 't':
             settings.num_threads = atoi(optarg);
             if (settings.num_threads <= 0) {
                 fprintf(stderr, "Number of threads must be greater than 0\n");
-                return 1;
+                exit(1);
             }
             /* There're other problems when you get above 64 threads.
              * In the future we should portably detect # of cores for the
@@ -6887,7 +6915,7 @@ int main (int argc, char **argv) {
         case 'D':
             if (! optarg || ! optarg[0]) {
                 fprintf(stderr, "No delimiter specified\n");
-                return 1;
+                exit(1);
             }
             settings.prefix_delimiter = optarg[0];
             settings.detail_enabled = 1;
@@ -6898,7 +6926,7 @@ int main (int argc, char **argv) {
             } else {
                 fprintf(stderr, "Cannot enable large pages on this system\n"
                     "(There is no Linux support as of this version)\n");
-                return 1;
+                exit(1);
             }
             break;
         case 'C' :
@@ -6963,18 +6991,18 @@ int main (int argc, char **argv) {
             case HASHPOWER_INIT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing numeric argument for hashpower\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.hashpower_init = atoi(subopts_value);
                 if (settings.hashpower_init < 12) {
                     fprintf(stderr, "Initial hashtable multiplier of %d is too low\n",
                         settings.hashpower_init);
-                    return 1;
+                    exit(1);
                 } else if (settings.hashpower_init > 32) {
                     fprintf(stderr, "Initial hashtable multiplier of %d is too high\n"
                         "Choose a value based on \"STAT hash_power_level\" from a running instance\n",
                         settings.hashpower_init);
-                    return 1;
+                    exit(1);
                 }
                 break;
             case NO_HASHEXPAND:
@@ -6991,46 +7019,46 @@ int main (int argc, char **argv) {
                 settings.slab_automove = atoi(subopts_value);
                 if (settings.slab_automove < 0 || settings.slab_automove > 2) {
                     fprintf(stderr, "slab_automove must be between 0 and 2\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case SLAB_AUTOMOVE_RATIO:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing slab_automove_ratio argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.slab_automove_ratio = atof(subopts_value);
                 if (settings.slab_automove_ratio <= 0 || settings.slab_automove_ratio > 1) {
                     fprintf(stderr, "slab_automove_ratio must be > 0 and < 1\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case SLAB_AUTOMOVE_WINDOW:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing slab_automove_window argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.slab_automove_window = atoi(subopts_value);
                 if (settings.slab_automove_window < 3) {
                     fprintf(stderr, "slab_automove_window must be > 2\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case TAIL_REPAIR_TIME:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing numeric argument for tail_repair_time\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.tail_repair_time = atoi(subopts_value);
                 if (settings.tail_repair_time < 10) {
                     fprintf(stderr, "Cannot set tail_repair_time to less than 10 seconds\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case HASH_ALGORITHM:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing hash_algorithm argument\n");
-                    return 1;
+                    exit(1);
                 };
                 if (strcmp(subopts_value, "jenkins") == 0) {
                     hash_type = JENKINS_HASH;
@@ -7038,7 +7066,7 @@ int main (int argc, char **argv) {
                     hash_type = MURMUR3_HASH;
                 } else {
                     fprintf(stderr, "Unknown hash_algorithm option (jenkins, murmur3)\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case LRU_CRAWLER:
@@ -7047,22 +7075,22 @@ int main (int argc, char **argv) {
             case LRU_CRAWLER_SLEEP:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing lru_crawler_sleep value\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.lru_crawler_sleep = atoi(subopts_value);
                 if (settings.lru_crawler_sleep > 1000000 || settings.lru_crawler_sleep < 0) {
                     fprintf(stderr, "LRU crawler sleep must be between 0 and 1 second\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case LRU_CRAWLER_TOCRAWL:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing lru_crawler_tocrawl value\n");
-                    return 1;
+                    exit(1);
                 }
                 if (!safe_strtoul(subopts_value, &tocrawl)) {
                     fprintf(stderr, "lru_crawler_tocrawl takes a numeric 32bit value\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.lru_crawler_tocrawl = tocrawl;
                 break;
@@ -7073,51 +7101,51 @@ int main (int argc, char **argv) {
             case HOT_LRU_PCT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing hot_lru_pct argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.hot_lru_pct = atoi(subopts_value);
                 if (settings.hot_lru_pct < 1 || settings.hot_lru_pct >= 80) {
                     fprintf(stderr, "hot_lru_pct must be > 1 and < 80\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case WARM_LRU_PCT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing warm_lru_pct argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.warm_lru_pct = atoi(subopts_value);
                 if (settings.warm_lru_pct < 1 || settings.warm_lru_pct >= 80) {
                     fprintf(stderr, "warm_lru_pct must be > 1 and < 80\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case HOT_MAX_FACTOR:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing hot_max_factor argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.hot_max_factor = atof(subopts_value);
                 if (settings.hot_max_factor <= 0) {
                     fprintf(stderr, "hot_max_factor must be > 0\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case WARM_MAX_FACTOR:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing warm_max_factor argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.warm_max_factor = atof(subopts_value);
                 if (settings.warm_max_factor <= 0) {
                     fprintf(stderr, "warm_max_factor must be > 0\n");
-                    return 1;
+                    exit(1);
                 }
                 break;
             case TEMPORARY_TTL:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing temporary_ttl argument\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.temp_lru = true;
                 settings.temporary_ttl = atoi(subopts_value);
@@ -7125,29 +7153,29 @@ int main (int argc, char **argv) {
             case IDLE_TIMEOUT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing numeric argument for idle_timeout\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.idle_timeout = atoi(subopts_value);
                 break;
             case WATCHER_LOGBUF_SIZE:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing watcher_logbuf_size argument\n");
-                    return 1;
+                    exit(1);
                 }
                 if (!safe_strtoul(subopts_value, &settings.logger_watcher_buf_size)) {
                     fprintf(stderr, "could not parse argument to watcher_logbuf_size\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.logger_watcher_buf_size *= 1024; /* kilobytes */
                 break;
             case WORKER_LOGBUF_SIZE:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing worker_logbuf_size argument\n");
-                    return 1;
+                    exit(1);
                 }
                 if (!safe_strtoul(subopts_value, &settings.logger_buf_size)) {
                     fprintf(stderr, "could not parse argument to worker_logbuf_size\n");
-                    return 1;
+                    exit(1);
                 }
                 settings.logger_buf_size *= 1024; /* kilobytes */
             case SLAB_SIZES:
@@ -7341,7 +7369,6 @@ int main (int argc, char **argv) {
                 }
                 settings.slab_reassign = false;
                 settings.slab_automove = 0;
-                settings.maxconns_fast = false;
                 settings.inline_ascii_response = true;
                 settings.lru_segmented = false;
                 hash_type = JENKINS_HASH;
@@ -7358,7 +7385,7 @@ int main (int argc, char **argv) {
 #endif
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
-                return 1;
+                exit(1);
             }
 
             }
@@ -7366,10 +7393,17 @@ int main (int argc, char **argv) {
             break;
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
-            return 1;
+            exit(1);
         }
     }
+}
 
+static int memcached_init(void);
+static void memcached_main(void *arg);
+
+
+static void validate_settings(void)
+{
     if (settings.item_size_max < 1024) {
         fprintf(stderr, "Item max size cannot be less than 1024 bytes.\n");
         exit(EX_USAGE);
@@ -7478,10 +7512,13 @@ int main (int argc, char **argv) {
             }
         }
     }
+}
 
-    if (udp_specified && settings.udpport != 0 && !tcp_specified) {
-        settings.port = settings.udpport;
-    }
+
+static int memcached_init(void) {
+
+    /* Run regardless of initializing it later */
+    init_lru_maintainer();
 
     if (maxcore != 0) {
         struct rlimit rlim_new;
@@ -7505,40 +7542,24 @@ int main (int argc, char **argv) {
 
         if ((getrlimit(RLIMIT_CORE, &rlim) != 0) || rlim.rlim_cur == 0) {
             fprintf(stderr, "failed to ensure corefile creation\n");
-            exit(EX_OSERR);
+            return -EX_OSERR;
         }
     }
 
-    /*
-     * If needed, increase rlimits to allow as many connections
-     * as needed.
-     */
-
-    if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
-        fprintf(stderr, "failed to getrlimit number of files\n");
-        exit(EX_OSERR);
-    } else {
-        rlim.rlim_cur = settings.maxconns;
-        rlim.rlim_max = settings.maxconns;
-        if (setrlimit(RLIMIT_NOFILE, &rlim) != 0) {
-            fprintf(stderr, "failed to set rlimit for open files. Try starting as root or requesting smaller maxconns value.\n");
-            exit(EX_OSERR);
-        }
-    }
 
     /* lose root privileges if we have them */
     if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
             fprintf(stderr, "can't run as root without the -u switch\n");
-            exit(EX_USAGE);
+            return -EX_USAGE;
         }
         if ((pw = getpwnam(username)) == 0) {
             fprintf(stderr, "can't find the user %s to switch to\n", username);
-            exit(EX_NOUSER);
+            return -EX_NOUSER;
         }
         if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
             fprintf(stderr, "failed to assume identity of user %s\n", username);
-            exit(EX_OSERR);
+            return -EX_OSERR;
         }
     }
 
@@ -7555,7 +7576,7 @@ int main (int argc, char **argv) {
         }
         if (daemonize(maxcore, settings.verbose) == -1) {
             fprintf(stderr, "failed to daemon() in order to daemonize\n");
-            exit(EXIT_FAILURE);
+            return EXIT_FAILURE;
         }
     }
 
@@ -7572,7 +7593,8 @@ int main (int argc, char **argv) {
 #endif
     }
 
-    /* initialize main thread libevent instance */
+#if 0
+/* initialize main thread libevent instance */
 #if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
     /* If libevent version is larger/equal to 2.0.2-alpha, use newer version */
     struct event_config *ev_config;
@@ -7584,12 +7606,33 @@ int main (int argc, char **argv) {
     /* Otherwise, use older API */
     main_base = event_init();
 #endif
+#endif
 
-    /* initialize other stuff */
-    logger_init();
+    items_init();
     stats_init();
+    logger_init();
+    slabs_global_init();
+
+    memcached_thread_init(settings.num_threads, NULL);
+
+    udp_conn_tcache = tcache_create("udp_conn_tcache", &udp_conn_tcache_ops,
+                                TCACHE_DEFAULT_MAG_SIZE, sizeof(conn));
+    BUG_ON(udp_conn_tcache == NULL);
+    tcp_conn_tcache = tcache_create("tcp_conn_tcache", &tcp_conn_tcache_ops,
+                                TCACHE_DEFAULT_MAG_SIZE, sizeof(conn));
+    BUG_ON(tcp_conn_tcache == NULL);
+
+    return 0;
+}
+
+static void memcached_main(void *arg)
+{
+    int ret;
+    /* initialize other stuff */
+   if (start_logger_thread() != 0) {
+        abort();
+    }
     assoc_init(settings.hashpower_init);
-    conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate,
             use_slab_sizes ? slab_sizes : NULL);
 #ifdef EXTSTORE
@@ -7619,23 +7662,7 @@ int main (int argc, char **argv) {
         slabs_prefill_global();
     }
 #endif
-    /*
-     * ignore SIGPIPE signals; we can use errno == EPIPE if we
-     * need that information
-     */
-    if (sigignore(SIGPIPE) == -1) {
-        perror("failed to ignore SIGPIPE; sigaction");
-        exit(EX_OSERR);
-    }
-    /* start up worker threads if MT mode */
-#ifdef EXTSTORE
-    slabs_set_storage(storage);
-    memcached_thread_init(settings.num_threads, storage);
-    init_lru_crawler(storage);
-#else
-    memcached_thread_init(settings.num_threads, NULL);
     init_lru_crawler(NULL);
-#endif
 
     if (start_assoc_maint && start_assoc_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
@@ -7644,18 +7671,10 @@ int main (int argc, char **argv) {
         fprintf(stderr, "Failed to enable LRU crawler thread\n");
         exit(EXIT_FAILURE);
     }
-#ifdef EXTSTORE
-    if (storage && start_storage_compact_thread(storage) != 0) {
-        fprintf(stderr, "Failed to start storage compaction thread\n");
-        exit(EXIT_FAILURE);
-    }
 
-    if (start_lru_maintainer && start_lru_maintainer_thread(storage) != 0) {
-#else
     if (start_lru_maintainer && start_lru_maintainer_thread(NULL) != 0) {
-#endif
         fprintf(stderr, "Failed to enable LRU maintainer thread\n");
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
     if (settings.slab_reassign &&
@@ -7663,22 +7682,11 @@ int main (int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    if (settings.idle_timeout && start_conn_timeout_thread() == -1) {
-        exit(EXIT_FAILURE);
-    }
-
     /* initialise clock event */
-    clock_handler(0, 0, 0);
+    ret = thread_spawn(clock_thread, NULL);
+    BUG_ON(ret);
 
-    /* create unix mode sockets after dropping privileges */
-    if (settings.socketpath != NULL) {
-        errno = 0;
-        if (server_socket_unix(settings.socketpath,settings.access)) {
-            vperror("failed to listen on UNIX socket: %s", settings.socketpath);
-            exit(EX_OSERR);
-        }
-    }
-
+#if 0
     /* create the listening socket, bind it, and init */
     if (settings.socketpath == NULL) {
         const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
@@ -7692,8 +7700,7 @@ int main (int argc, char **argv) {
             snprintf(temp_portnumber_filename,
                      len,
                      "%s.lck", portnumber_filename);
-
-            portnumber_file = fopen(temp_portnumber_filename, "a");
+             portnumber_file = fopen(temp_portnumber_filename, "a");
             if (portnumber_file == NULL) {
                 fprintf(stderr, "Failed to open \"%s\": %s\n",
                         temp_portnumber_filename, strerror(errno));
@@ -7706,15 +7713,13 @@ int main (int argc, char **argv) {
             vperror("failed to listen on TCP port %d", settings.port);
             exit(EX_OSERR);
         }
-
-        /*
+         /*
          * initialization order: first create the listening sockets
          * (may need root on low ports), then drop root if needed,
          * then daemonize if needed, then init libevent (in some cases
          * descriptors created by libevent wouldn't survive forking).
          */
-
-        /* create the UDP listening socket and bind it */
+         /* create the UDP listening socket and bind it */
         errno = 0;
         if (settings.udpport && server_sockets(settings.udpport, udp_transport,
                                               portnumber_file)) {
@@ -7729,8 +7734,7 @@ int main (int argc, char **argv) {
         if (temp_portnumber_filename)
             free(temp_portnumber_filename);
     }
-
-    /* Give the sockets a moment to open. I know this is dumb, but the error
+     /* Give the sockets a moment to open. I know this is dumb, but the error
      * is only an advisory.
      */
     usleep(1000);
@@ -7738,6 +7742,9 @@ int main (int argc, char **argv) {
         fprintf(stderr, "Maxconns setting is too low, use -c to increase.\n");
         exit(EXIT_FAILURE);
     }
+#endif
+
+    timer_sleep(1000);
 
     if (pid_file != NULL) {
         save_pid(pid_file);
@@ -7751,16 +7758,49 @@ int main (int argc, char **argv) {
     /* Initialize the uriencode lookup table. */
     uriencode_init();
 
-    /* enter the event loop */
-    if (event_base_loop(main_base, 0) != 0) {
-        retval = EXIT_FAILURE;
+    BUG_ON(!settings.udpport && !settings.port);
+
+    if (settings.udpport) {
+        struct netaddr l_udp = {
+            .ip = 0,
+            .port = settings.udpport
+        };
+
+        udpspawner_t *spawner;
+        ret = udp_create_spawner(l_udp, udp_handler, &spawner);
+        BUG_ON(ret);
     }
+
+    if (settings.port) {
+        struct netaddr l_tcp = {
+            .ip = 0,
+            .port = settings.port
+        };
+
+        tcpqueue_t *queue;
+        ret = tcp_listen(l_tcp, settings.backlog, &queue);
+        BUG_ON(ret);
+
+        // Accept new connections
+        while (true) {
+            tcpconn_t *conn;
+            ret = tcp_accept(queue, &conn);
+            BUG_ON(ret);
+            thread_spawn(handle_tcp_conn, conn);
+        }
+    }
+
+    waitgroup_t wg;
+    waitgroup_init(&wg);
+    waitgroup_add(&wg, 1);
+    waitgroup_wait(&wg);
 
     stop_assoc_maintenance_thread();
 
     /* remove the PID file if we're a daemon */
     if (do_daemonize)
         remove_pidfile(pid_file);
+#if 0
     /* Clean up strdup() call for bind() address */
     if (settings.inter)
       free(settings.inter);
@@ -7771,6 +7811,75 @@ int main (int argc, char **argv) {
 
     /* cleanup base */
     event_base_free(main_base);
+#endif
 
-    return retval;
+    exit(EXIT_SUCCESS);
+}
+
+int perthread_initializer(void);
+
+int perthread_initializer(void)
+{
+    tcache_init_perthread(udp_conn_tcache, &udp_conn_tcache_pt);
+    tcache_init_perthread(tcp_conn_tcache, &tcp_conn_tcache_pt);
+
+    return memcached_perthread_init();
+}
+
+int late_initializer(void);
+
+int late_initializer(void)
+{
+    // Preallocate some connections. seems to help with random segfaults
+#define NREP 8000
+    void *conns[NREP];
+    int i,j;
+
+    for (i = 0; i < NREP; i++) {
+        conns[i] = tcache_alloc(&udp_conn_tcache_pt);
+        if(!conns[i])
+            break;
+    }
+
+    for (j = 0; j < i; j++) {
+        tcache_free(&udp_conn_tcache_pt, conns[j]);
+    }
+    return i == NREP ? 0 : -1;
+}
+
+int main(int argc, char **argv) {
+    int ret;
+
+    if (argc < 2) {
+            printf("arg must be config file\n");
+            return -EINVAL;
+    }
+
+    /* init settings */
+    settings_init();
+
+    /* handle SIGINT and SIGTERM */
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    /* set stderr non-buffering (for running under, say, daemontools) */
+    setbuf(stderr, NULL);
+
+    char *cfgpath = argv[1];
+    argv[1] = argv[0];
+
+    arg_parse(argv + 1);
+
+    validate_settings();
+
+    ret = runtime_set_initializers(memcached_init, perthread_initializer, late_initializer);
+    BUG_ON(ret);
+
+    ret = runtime_init(cfgpath, memcached_main, argv + 1);
+    if (ret) {
+            printf("failed to start runtime\n");
+            return ret;
+    }
+
+    return 0;
 }

@@ -8,7 +8,6 @@
 #define LOGGER_BUF_SIZE 1024 * 64
 #define LOGGER_WATCHER_BUF_SIZE 1024 * 256
 #define LOGGER_ENTRY_MAX_SIZE 2048
-#define GET_LOGGER() ((logger *) pthread_getspecific(logger_key));
 
 /* Inlined from memcached.h - should go into sub header */
 typedef unsigned int rel_time_t;
@@ -122,7 +121,7 @@ typedef struct _logentry {
 typedef struct _logger {
     struct _logger *prev;
     struct _logger *next;
-    pthread_mutex_t mutex; /* guard for this + *buf */
+    mutex_t mutex; /* guard for this + *buf */
     uint64_t written; /* entries written to the buffer */
     uint64_t dropped; /* entries dropped */
     uint64_t blocked; /* times blocked instead of dropped */
@@ -139,8 +138,7 @@ enum logger_watcher_type {
 };
 
 typedef struct  {
-    void *c; /* original connection structure. still with source thread attached */
-    int sfd; /* client fd */
+    void *c; /* original connection structure. */
     int id; /* id number for watcher list */
     uint64_t skipped; /* lines skipped since last successful print */
     bool failed_flush; /* recently failed to write out (EAGAIN), wait before retry */
@@ -157,18 +155,17 @@ struct logger_stats {
     uint64_t watcher_sent;
 };
 
-extern pthread_key_t logger_key;
-
 /* public functions */
 
 void logger_init(void);
+int start_logger_thread(void);
 logger *logger_create(void);
 
-#define LOGGER_LOG(l, flag, type, ...) \
+#define LOGGER_LOG(ll, flag, type, ...) \
     do { \
-        logger *myl = l; \
-        if (l == NULL) \
-            myl = GET_LOGGER(); \
+        logger *myl = ll; \
+        if (ll == NULL) \
+            myl = mythr()->l; \
         if (myl->eflags & flag) \
             logger_log(myl, type, __VA_ARGS__); \
     } while (0)
@@ -181,6 +178,6 @@ enum logger_add_watcher_ret {
     LOGGER_ADD_WATCHER_FAILED
 };
 
-enum logger_add_watcher_ret logger_add_watcher(void *c, const int sfd, uint16_t f);
+enum logger_add_watcher_ret logger_add_watcher(void *c, uint16_t f);
 
 #endif

@@ -72,7 +72,7 @@ void fill_item_stats_automove(item_stats_automove *am);
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update);
 item *do_item_touch(const char *key, const size_t nkey, uint32_t exptime, const uint32_t hv, conn *c);
 void item_stats_reset(void);
-extern pthread_mutex_t lru_locks[POWER_LARGEST];
+extern mutex_t lru_locks[POWER_LARGEST];
 
 int start_lru_maintainer_thread(void *arg);
 int stop_lru_maintainer_thread(void);
@@ -94,3 +94,5 @@ void *lru_bump_buf_create(void);
 #else
 #define STORAGE_delete(...)
 #endif
+
+extern int items_init(void);

@@ -1,4 +1,5 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+#if 0
 #undef NDEBUG
 #include <pthread.h>
 #include <sys/types.h>
@@ -2027,3 +2028,6 @@ int main(int argc, char **argv)
 
     return exitcode;
 }
+#else
+int main() { return -1; }
+#endif

@@ -10,16 +10,15 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
 #include <time.h>
-#include <assert.h>
 #include <unistd.h>
-#include <poll.h>
+
+static waitgroup_t lru_maintainer_thread_wg;
 
 /* Forward Declarations */
 static void item_link_q(item *it);
@@ -62,16 +61,16 @@ static int stats_sizes_buckets = 0;
 
 static volatile int do_run_lru_maintainer_thread = 0;
 static int lru_maintainer_initialized = 0;
-static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
+static mutex_t lru_maintainer_lock;
+static mutex_t cas_id_lock;
+static mutex_t stats_sizes_lock;
 
 void item_stats_reset(void) {
     int i;
     for (i = 0; i < LARGEST_ID; i++) {
-        pthread_mutex_lock(&lru_locks[i]);
+        mutex_lock(&lru_locks[i]);
         memset(&itemstats[i], 0, sizeof(itemstats_t));
-        pthread_mutex_unlock(&lru_locks[i]);
+        mutex_unlock(&lru_locks[i]);
     }
 }
 
@@ -86,7 +85,7 @@ void do_item_stats_add_crawl(const int i, const uint64_t reclaimed,
 typedef struct _lru_bump_buf {
     struct _lru_bump_buf *prev;
     struct _lru_bump_buf *next;
-    pthread_mutex_t mutex;
+    mutex_t mutex;
     bipbuf_t *buf;
     uint64_t dropped;
 } lru_bump_buf;
@@ -98,7 +97,7 @@ typedef struct {
 
 static lru_bump_buf *bump_buf_head = NULL;
 static lru_bump_buf *bump_buf_tail = NULL;
-static pthread_mutex_t bump_buf_lock = PTHREAD_MUTEX_INITIALIZER;
+static DEFINE_SPINLOCK(bump_buf_lock);
 /* TODO: tunable? Need bench results */
 #define LRU_BUMP_BUF_SIZE 8192
 
@@ -109,9 +108,9 @@ static uint64_t lru_total_bumps_dropped(void);
 /* TODO: refactor some atomics for this. */
 uint64_t get_cas_id(void) {
     static uint64_t cas_id = 0;
-    pthread_mutex_lock(&cas_id_lock);
+    mutex_lock(&cas_id_lock);
     uint64_t next_id = ++cas_id;
-    pthread_mutex_unlock(&cas_id_lock);
+    mutex_unlock(&cas_id_lock);
     return next_id;
 }
 
@@ -132,9 +131,9 @@ static unsigned int temp_lru_size(int slabs_clsid) {
     int id = CLEAR_LRU(slabs_clsid);
     id |= TEMP_LRU;
     unsigned int ret;
-    pthread_mutex_lock(&lru_locks[id]);
+    mutex_lock(&lru_locks[id]);
     ret = sizes_bytes[id];
-    pthread_mutex_unlock(&lru_locks[id]);
+    mutex_unlock(&lru_locks[id]);
     return ret;
 }
 
@@ -215,9 +214,9 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
     }
 
     if (i > 0) {
-        pthread_mutex_lock(&lru_locks[id]);
+        mutex_lock(&lru_locks[id]);
         itemstats[id].direct_reclaims += i;
-        pthread_mutex_unlock(&lru_locks[id]);
+        mutex_unlock(&lru_locks[id]);
     }
 
     return it;
@@ -295,9 +294,9 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     }
 
     if (it == NULL) {
-        pthread_mutex_lock(&lru_locks[id]);
+        mutex_lock(&lru_locks[id]);
         itemstats[id].outofmemory++;
-        pthread_mutex_unlock(&lru_locks[id]);
+        mutex_unlock(&lru_locks[id]);
         return NULL;
     }
 
@@ -411,16 +410,16 @@ static void do_item_link_q(item *it) { /* item is the new head */
 }
 
 static void item_link_q(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 static void item_link_q_warm(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
     itemstats[it->slabs_clsid].moves_to_warm++;
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 static void do_item_unlink_q(item *it) {
@@ -456,9 +455,9 @@ static void do_item_unlink_q(item *it) {
 }
 
 static void item_unlink_q(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_unlink_q(it);
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 int do_item_link(item *it, const uint32_t hv) {
@@ -597,7 +596,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     unsigned int id = slabs_clsid;
     id |= COLD_LRU;
 
-    pthread_mutex_lock(&lru_locks[id]);
+    mutex_lock(&lru_locks[id]);
     it = heads[id];
 
     buffer = malloc((size_t)memlimit);
@@ -631,7 +630,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     bufcurr += 5;
 
     *bytes = bufcurr;
-    pthread_mutex_unlock(&lru_locks[id]);
+    mutex_unlock(&lru_locks[id]);
     return buffer;
 }
 
@@ -645,20 +644,20 @@ void fill_item_stats_automove(item_stats_automove *am) {
 
         // outofmemory records into HOT
         int i = n | HOT_LRU;
-        pthread_mutex_lock(&lru_locks[i]);
+        mutex_lock(&lru_locks[i]);
         cur->outofmemory = itemstats[i].outofmemory;
-        pthread_mutex_unlock(&lru_locks[i]);
+        mutex_unlock(&lru_locks[i]);
 
         // evictions and tail age are from COLD
         i = n | COLD_LRU;
-        pthread_mutex_lock(&lru_locks[i]);
+        mutex_lock(&lru_locks[i]);
         cur->evicted = itemstats[i].evicted;
         if (tails[i]) {
             cur->age = current_time - tails[i]->time;
         } else {
             cur->age = 0;
         }
-        pthread_mutex_unlock(&lru_locks[i]);
+        mutex_unlock(&lru_locks[i]);
      }
 }
 
@@ -671,7 +670,7 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
         int i;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
+            mutex_lock(&lru_locks[i]);
             totals.expired_unfetched += itemstats[i].expired_unfetched;
             totals.evicted_unfetched += itemstats[i].evicted_unfetched;
             totals.evicted_active += itemstats[i].evicted_active;
@@ -684,7 +683,7 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
             totals.moves_to_warm += itemstats[i].moves_to_warm;
             totals.moves_within_lru += itemstats[i].moves_within_lru;
             totals.direct_reclaims += itemstats[i].direct_reclaims;
-            pthread_mutex_unlock(&lru_locks[i]);
+            mutex_unlock(&lru_locks[i]);
         }
     }
     APPEND_STAT("expired_unfetched", "%llu",
@@ -739,7 +738,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
         int klen = 0, vlen = 0;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
+            mutex_lock(&lru_locks[i]);
             totals.evicted += itemstats[i].evicted;
             totals.evicted_nonzero += itemstats[i].evicted_nonzero;
             totals.outofmemory += itemstats[i].outofmemory;
@@ -780,7 +779,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
                     totals.hits_to_temp = thread_stats.lru_hits[i];
                     break;
             }
-            pthread_mutex_unlock(&lru_locks[i]);
+            mutex_unlock(&lru_locks[i]);
         }
         if (size == 0)
             continue;
@@ -987,24 +986,24 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
         was_found = 1;
         if (item_is_flushed(it)) {
             do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
+            STORAGE_delete(mythr()->storage, it);
             do_item_remove(it);
             it = NULL;
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.get_flushed++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            mutex_lock(&mythr()->stats.mutex);
+            mythr()->stats.get_flushed++;
+            mutex_unlock(&mythr()->stats.mutex);
             if (settings.verbose > 2) {
                 fprintf(stderr, " -nuked by flush");
             }
             was_found = 2;
         } else if (it->exptime != 0 && it->exptime <= current_time) {
             do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
+            STORAGE_delete(mythr()->storage, it);
             do_item_remove(it);
             it = NULL;
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.get_expired++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            mutex_lock(&mythr()->stats.mutex);
+            mythr()->stats.get_expired++;
+            mutex_unlock(&mythr()->stats.mutex);
             if (settings.verbose > 2) {
                 fprintf(stderr, " -nuked by expire");
             }
@@ -1025,7 +1024,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
                             it->it_flags |= ITEM_ACTIVE;
                             if (ITEM_lruid(it) != COLD_LRU) {
                                 do_item_update(it); // bump LA time
-                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                            } else if (!lru_bump_async(mythr()->lru_bump_buf, it, hv)) {
                                 // add flag before async bump to avoid race.
                                 it->it_flags &= ~ITEM_ACTIVE;
                             }
@@ -1043,7 +1042,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
     if (settings.verbose > 2)
         fprintf(stderr, "\n");
     /* For now this is in addition to the above verbose logging. */
-    LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
+    LOGGER_LOG(mythr()->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
                (it) ? ITEM_clsid(it) : 0);
 
     return it;
@@ -1079,7 +1078,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
     uint64_t limit = 0;
 
     id |= cur_lru;
-    pthread_mutex_lock(&lru_locks[id]);
+    mutex_lock(&lru_locks[id]);
     search = tails[id];
     /* We walk up *only* for locked items, and if bottom is expired. */
     for (; tries > 0 && search != NULL; tries--, search=next_it) {
@@ -1088,7 +1087,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
             /* We are a crawler, ignore it. */
             if (flags & LRU_PULL_CRAWL_BLOCKS) {
-                pthread_mutex_unlock(&lru_locks[id]);
+                mutex_unlock(&lru_locks[id]);
                 return 0;
             }
             tries++;
@@ -1220,7 +1219,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
             break;
     }
 
-    pthread_mutex_unlock(&lru_locks[id]);
+    mutex_unlock(&lru_locks[id]);
 
     if (it != NULL) {
         if (move_to_lru) {
@@ -1240,7 +1239,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
 
 /* TODO: Third place this code needs to be deduped */
 static void lru_bump_buf_link_q(lru_bump_buf *b) {
-    pthread_mutex_lock(&bump_buf_lock);
+    spin_lock(&bump_buf_lock);
     assert(b != bump_buf_head);
 
     b->prev = 0;
@@ -1248,7 +1247,7 @@ static void lru_bump_buf_link_q(lru_bump_buf *b) {
     if (b->next) b->next->prev = b;
     bump_buf_head = b;
     if (bump_buf_tail == 0) bump_buf_tail = b;
-    pthread_mutex_unlock(&bump_buf_lock);
+    spin_unlock(&bump_buf_lock);
     return;
 }
 
@@ -1264,7 +1263,7 @@ void *item_lru_bump_buf_create(void) {
         return NULL;
     }
 
-    pthread_mutex_init(&b->mutex, NULL);
+    mutex_init(&b->mutex);
 
     lru_bump_buf_link_q(b);
     return b;
@@ -1273,7 +1272,7 @@ void *item_lru_bump_buf_create(void) {
 static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
     bool ret = true;
     refcount_incr(it);
-    pthread_mutex_lock(&b->mutex);
+    mutex_lock(&b->mutex);
     lru_bump_entry *be = (lru_bump_entry *) bipbuf_request(b->buf, sizeof(lru_bump_entry));
     if (be != NULL) {
         be->it = it;
@@ -1289,7 +1288,7 @@ static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
     if (!ret) {
         refcount_decr(it);
     }
-    pthread_mutex_unlock(&b->mutex);
+    mutex_unlock(&b->mutex);
     return ret;
 }
 
@@ -1305,11 +1304,11 @@ static bool lru_maintainer_bumps(void) {
     unsigned int size;
     unsigned int todo;
     bool bumped = false;
-    pthread_mutex_lock(&bump_buf_lock);
+    spin_lock(&bump_buf_lock);
     for (b = bump_buf_head; b != NULL; b=b->next) {
-        pthread_mutex_lock(&b->mutex);
+        mutex_lock(&b->mutex);
         be = (lru_bump_entry *) bipbuf_peek_all(b->buf, &size);
-        pthread_mutex_unlock(&b->mutex);
+        mutex_unlock(&b->mutex);
 
         if (be == NULL) {
             continue;
@@ -1326,24 +1325,24 @@ static bool lru_maintainer_bumps(void) {
             todo -= sizeof(lru_bump_entry);
         }
 
-        pthread_mutex_lock(&b->mutex);
+        mutex_lock(&b->mutex);
         be = (lru_bump_entry *) bipbuf_poll(b->buf, size);
-        pthread_mutex_unlock(&b->mutex);
+        mutex_unlock(&b->mutex);
     }
-    pthread_mutex_unlock(&bump_buf_lock);
+    spin_unlock(&bump_buf_lock);
     return bumped;
 }
 
 static uint64_t lru_total_bumps_dropped(void) {
     uint64_t total = 0;
     lru_bump_buf *b;
-    pthread_mutex_lock(&bump_buf_lock);
+    spin_lock(&bump_buf_lock);
     for (b = bump_buf_head; b != NULL; b=b->next) {
-        pthread_mutex_lock(&b->mutex);
+        mutex_lock(&b->mutex);
         total += b->dropped;
-        pthread_mutex_unlock(&b->mutex);
+        mutex_unlock(&b->mutex);
     }
-    pthread_mutex_unlock(&bump_buf_lock);
+    spin_unlock(&bump_buf_lock);
     return total;
 }
 
@@ -1381,11 +1380,11 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     rel_time_t warm_age = 0;
     /* If LRU is in flat mode, force items to drain into COLD via max age */
     if (settings.lru_segmented) {
-        pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
+        mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
         if (tails[slabs_clsid|COLD_LRU]) {
             cold_age = current_time - tails[slabs_clsid|COLD_LRU]->time;
         }
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
+        mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
         hot_age = cold_age * settings.hot_max_factor;
         warm_age = cold_age * settings.warm_max_factor;
     }
@@ -1436,7 +1435,7 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
         /* We've not successfully kicked off a crawl yet. */
         if (s->run_complete) {
             char *lru_name = "na";
-            pthread_mutex_lock(&cdata->lock);
+            mutex_lock(&cdata->lock);
             int x;
             /* Should we crawl again? */
             uint64_t possible_reclaims = s->seen - s->noexp;
@@ -1494,14 +1493,14 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
                     s->reclaimed);
             // Got our calculation, avoid running until next actual run.
             s->run_complete = false;
-            pthread_mutex_unlock(&cdata->lock);
+            mutex_unlock(&cdata->lock);
         }
         if (current_time > next_crawls[i]) {
-            pthread_mutex_lock(&lru_locks[i]);
+            mutex_lock(&lru_locks[i]);
             if (sizes[i] > tocrawl_limit) {
                 tocrawl_limit = sizes[i];
             }
-            pthread_mutex_unlock(&lru_locks[i]);
+            mutex_unlock(&lru_locks[i]);
             todo[i] = 1;
             do_run = true;
             next_crawls[i] = current_time + 5; // minimum retry wait.
@@ -1511,7 +1510,7 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
         if (settings.lru_crawler_tocrawl && settings.lru_crawler_tocrawl < tocrawl_limit) {
             tocrawl_limit = settings.lru_crawler_tocrawl;
         }
-        lru_crawler_start(todo, tocrawl_limit, CRAWLER_AUTOEXPIRE, cdata, NULL, 0);
+        lru_crawler_start(todo, tocrawl_limit, CRAWLER_AUTOEXPIRE, cdata, NULL);
     }
 }
 
@@ -1527,12 +1526,11 @@ slab_automove_reg_t slab_automove_extstore = {
     .run = slab_automove_extstore_run
 };
 #endif
-static pthread_t lru_maintainer_tid;
 
 #define MAX_LRU_MAINTAINER_SLEEP 1000000
 #define MIN_LRU_MAINTAINER_SLEEP 1000
 
-static void *lru_maintainer_thread(void *arg) {
+static void lru_maintainer_thread(void *arg) {
     slab_automove_reg_t *sam = &slab_automove_default;
 #ifdef EXTSTORE
     void *storage = arg;
@@ -1553,7 +1551,7 @@ static void *lru_maintainer_thread(void *arg) {
         fprintf(stderr, "Failed to allocate crawler data for LRU maintainer thread\n");
         abort();
     }
-    pthread_mutex_init(&cdata->lock, NULL);
+    mutex_init(&cdata->lock);
     cdata->crawl_complete = true; // kick off the crawler.
     logger *l = logger_create();
     if (l == NULL) {
@@ -1564,14 +1562,14 @@ static void *lru_maintainer_thread(void *arg) {
     double last_ratio = settings.slab_automove_ratio;
     void *am = sam->init(&settings);
 
-    pthread_mutex_lock(&lru_maintainer_lock);
+    mutex_lock(&lru_maintainer_lock);
     if (settings.verbose > 2)
         fprintf(stderr, "Starting LRU maintainer background thread\n");
     while (do_run_lru_maintainer_thread) {
-        pthread_mutex_unlock(&lru_maintainer_lock);
+        mutex_unlock(&lru_maintainer_lock);
         if (to_sleep)
-            usleep(to_sleep);
-        pthread_mutex_lock(&lru_maintainer_lock);
+            timer_sleep(to_sleep);
+        mutex_lock(&lru_maintainer_lock);
         /* A sleep of zero counts as a minimum of a 1ms wait */
         last_sleep = to_sleep > 1000 ? to_sleep : 1000;
         to_sleep = MAX_LRU_MAINTAINER_SLEEP;
@@ -1658,26 +1656,24 @@ static void *lru_maintainer_thread(void *arg) {
             }
         }
     }
-    pthread_mutex_unlock(&lru_maintainer_lock);
+    mutex_unlock(&lru_maintainer_lock);
     sam->free(am);
     // LRU crawler *must* be stopped.
     free(cdata);
     if (settings.verbose > 2)
         fprintf(stderr, "LRU maintainer thread stopping\n");
 
-    return NULL;
+    waitgroup_done(&lru_maintainer_thread_wg);
+
 }
 
 int stop_lru_maintainer_thread(void) {
-    int ret;
-    pthread_mutex_lock(&lru_maintainer_lock);
+    mutex_lock(&lru_maintainer_lock);
     /* LRU thread is a sleep loop, will die on its own */
     do_run_lru_maintainer_thread = 0;
-    pthread_mutex_unlock(&lru_maintainer_lock);
-    if ((ret = pthread_join(lru_maintainer_tid, NULL)) != 0) {
-        fprintf(stderr, "Failed to stop LRU maintainer thread: %s\n", strerror(ret));
-        return -1;
-    }
+    mutex_unlock(&lru_maintainer_lock);
+    waitgroup_wait(&lru_maintainer_thread_wg);
+
     settings.lru_maintainer_thread = false;
     return 0;
 }
@@ -1685,33 +1681,35 @@ int stop_lru_maintainer_thread(void) {
 int start_lru_maintainer_thread(void *arg) {
     int ret;
 
-    pthread_mutex_lock(&lru_maintainer_lock);
+    mutex_lock(&lru_maintainer_lock);
     do_run_lru_maintainer_thread = 1;
     settings.lru_maintainer_thread = true;
-    if ((ret = pthread_create(&lru_maintainer_tid, NULL,
-        lru_maintainer_thread, arg)) != 0) {
+    waitgroup_init(&lru_maintainer_thread_wg);
+    waitgroup_add(&lru_maintainer_thread_wg, 1);
+    if ((ret = thread_spawn(lru_maintainer_thread, arg)) != 0) {
         fprintf(stderr, "Can't create LRU maintainer thread: %s\n",
             strerror(ret));
-        pthread_mutex_unlock(&lru_maintainer_lock);
+        mutex_unlock(&lru_maintainer_lock);
+        waitgroup_done(&lru_maintainer_thread_wg);
         return -1;
     }
-    pthread_mutex_unlock(&lru_maintainer_lock);
+    mutex_unlock(&lru_maintainer_lock);
 
     return 0;
 }
 
 /* If we hold this lock, crawler can't wake up or move */
 void lru_maintainer_pause(void) {
-    pthread_mutex_lock(&lru_maintainer_lock);
+    mutex_lock(&lru_maintainer_lock);
 }
 
 void lru_maintainer_resume(void) {
-    pthread_mutex_unlock(&lru_maintainer_lock);
+    mutex_unlock(&lru_maintainer_lock);
 }
 
 int init_lru_maintainer(void) {
     if (lru_maintainer_initialized == 0) {
-        pthread_mutex_init(&lru_maintainer_lock, NULL);
+        mutex_init(&lru_maintainer_lock);
         lru_maintainer_initialized = 1;
     }
     return 0;
@@ -1815,3 +1813,12 @@ item *do_item_crawl_q(item *it) {
 
     return it->next; /* success */
 }
+
+int items_init(void) {
+    mutex_init(&lru_maintainer_lock);
+    mutex_init(&cas_id_lock);
+    mutex_init(&stats_sizes_lock);
+    spin_lock_init(&bump_buf_lock);
+    return 0;
+}
+

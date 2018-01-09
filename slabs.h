@@ -9,6 +9,7 @@
     up front (if true), or allocate memory in chunks as it is needed (if false)
 */
 void slabs_init(const size_t limit, const double factor, const bool prealloc, const uint32_t *slab_sizes);
+int slabs_global_init(void);
 
 /** Call only during init. Pre-allocates all available memory */
 void slabs_prefill_global(void);

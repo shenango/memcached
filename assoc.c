@@ -17,16 +17,13 @@
 #include <sys/resource.h>
 #include <signal.h>
 #include <fcntl.h>
-#include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
-#include <pthread.h>
 
-static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
+static condvar_t maintenance_cond;
+static mutex_t maintenance_lock;
 
 typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
 typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
@@ -57,6 +54,8 @@ static bool started_expanding = false;
 static unsigned int expand_bucket = 0;
 
 void assoc_init(const int hashtable_init) {
+    condvar_init(&maintenance_cond);
+    mutex_init(&maintenance_lock);
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
@@ -147,7 +146,7 @@ void assoc_start_expand(uint64_t curr_items) {
     if (curr_items > (hashsize(hashpower) * 3) / 2 &&
           hashpower < HASHPOWER_MAX) {
         started_expanding = true;
-        pthread_cond_signal(&maintenance_cond);
+        condvar_signal(&maintenance_cond);
     }
 }
 
@@ -191,13 +190,13 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
 }
 
 
+static waitgroup_t assoc_maintenance_thread_wg;
 static volatile int do_run_maintenance_thread = 1;
 
 #define DEFAULT_HASH_BULK_MOVE 1
 int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
 
-static void *assoc_maintenance_thread(void *arg) {
-
+static void assoc_maintenance_thread(void *arg) {
     mutex_lock(&maintenance_lock);
     while (do_run_maintenance_thread) {
         int ii = 0;
@@ -235,7 +234,7 @@ static void *assoc_maintenance_thread(void *arg) {
                     }
 
             } else {
-                usleep(10*1000);
+                timer_sleep(10*1000);
             }
 
             if (item_lock) {
@@ -247,7 +246,7 @@ static void *assoc_maintenance_thread(void *arg) {
         if (!expanding) {
             /* We are done expanding.. just wait for next invocation */
             started_expanding = false;
-            pthread_cond_wait(&maintenance_cond, &maintenance_lock);
+            condvar_wait(&maintenance_cond, &maintenance_lock);
             /* assoc_expand() swaps out the hash table entirely, so we need
              * all threads to not hold any references related to the hash
              * table while this happens.
@@ -260,10 +259,9 @@ static void *assoc_maintenance_thread(void *arg) {
             pause_threads(RESUME_ALL_THREADS);
         }
     }
-    return NULL;
+    waitgroup_done(&assoc_maintenance_thread_wg);
 }
 
-static pthread_t maintenance_tid;
 
 int start_assoc_maintenance_thread() {
     int ret;
@@ -274,10 +272,12 @@ int start_assoc_maintenance_thread() {
             hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
         }
     }
-    pthread_mutex_init(&maintenance_lock, NULL);
-    if ((ret = pthread_create(&maintenance_tid, NULL,
-                              assoc_maintenance_thread, NULL)) != 0) {
+    waitgroup_init(&assoc_maintenance_thread_wg);
+    waitgroup_add(&assoc_maintenance_thread_wg, 1);
+    mutex_init(&maintenance_lock);
+    if ((ret = thread_spawn(assoc_maintenance_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
+        waitgroup_done(&assoc_maintenance_thread_wg);
         return -1;
     }
     return 0;
@@ -286,10 +286,10 @@ int start_assoc_maintenance_thread() {
 void stop_assoc_maintenance_thread() {
     mutex_lock(&maintenance_lock);
     do_run_maintenance_thread = 0;
-    pthread_cond_signal(&maintenance_cond);
+    condvar_signal(&maintenance_cond);
     mutex_unlock(&maintenance_lock);
 
     /* Wait for the maintenance thread to stop */
-    pthread_join(maintenance_tid, NULL);
+    waitgroup_wait(&assoc_maintenance_thread_wg);
 }
 
