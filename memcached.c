@@ -69,6 +69,7 @@
 #endif
 
 #define MEMCACHE_MAXUTIL 0.7
+#define MEMCACHE_LOADFACTOR 2.0
 
 /*
  * forward declarations
@@ -7196,7 +7197,8 @@ int main(int argc, char** argv) {
 
     /* Initialize Arachne */
     arachne_init(&argc, (const char**)argv);
-    // arachne_set_maxutil(MEMCACHE_MAXUTIL);
+    arachne_set_maxutil(MEMCACHE_MAXUTIL);
+    // arachne_set_loadfactor(MEMCACHE_LOADFACTOR);
 
     /* init settings */
     settings_init();
