@@ -6142,7 +6142,8 @@ void event_handler(const int fd, const short which, void *arg) {
     LIBEVENT_THREAD *thread = GET_THREAD();
     bool record = true; // Always record!
     if (record && thread != NULL) {
-        timetrace_record("[event_handler] Start of event_handler in dispatch %d", thread->worker_id);
+        timetrace_record("[event_handler] Start of event_handler in dispatch %d, fd %d",
+                         thread->worker_id, fd);
     }
 #endif
 
@@ -6187,8 +6188,8 @@ void event_handler(const int fd, const short which, void *arg) {
             conn_close(c);
 #ifdef TIMETRACE_HANDLE
             if (record && thread != NULL) {
-                timetrace_record("[event_handler] Conn closing in dispatch %d",
-                                  thread->worker_id);
+                timetrace_record("[event_handler] Conn closing in dispatch %d, fd %d",
+                                  thread->worker_id, fd);
             }
 #endif
             return;
@@ -6208,8 +6209,8 @@ void event_handler(const int fd, const short which, void *arg) {
         /* Start Arachne worker thread */
 #ifdef TIMETRACE_HANDLE
         if (record && thread != NULL) {
-            timetrace_record("[event_handler] Before creating thread in dispatch %d",
-                             thread->worker_id);
+            timetrace_record("[event_handler] Before creating thread in dispatch %d, fd %d",
+                             thread->worker_id, fd);
         }
 #endif
         arachne_thread_id arachne_tid;
@@ -6221,16 +6222,22 @@ void event_handler(const int fd, const short which, void *arg) {
 //            ret = arachne_thread_create(&arachne_tid, drive_machine, (void*)c);
 //        }
 #ifdef TIMETRACE_HANDLE
-        if (record && thread != NULL) {
-            timetrace_record("[event_handler] Finish creating thread in dispatch %d",
-                             thread->worker_id);
+        if (record && (thread != NULL) && (ret == 0)) {
+            timetrace_record("[event_handler] Finish creating thread in dispatch %d, fd %d",
+                             thread->worker_id, fd);
         }
 #endif
         // XXX: if cannot create a thread, then do it in place!
         if (ret != 0) {
             drive_machine((void *)c);
+#ifdef TIMETRACE_HANDLE
+            if (record && thread != NULL) {
+                timetrace_record("[event_handler] Failed to create thread in dispatch %d, fd %d"
+                                 " executed in dispatch.",
+                                 thread->worker_id, fd);
+            }
+#endif
         }
-
     } else {
         // XXX: Now with level trigger, may not need reactive, because workers will finish all read data
         // However, we still need to active if we are using edge trigger.
@@ -6238,7 +6245,7 @@ void event_handler(const int fd, const short which, void *arg) {
 #ifdef TIMETRACE_HANDLE
         if (record && thread != NULL) {
             timetrace_record("[event_handler] End of event_handler, !finished."
-                             " in dispatch %d", thread->worker_id);
+                             " in dispatch %d, fd %d", thread->worker_id, fd);
         }
 #endif
         return;
@@ -6246,8 +6253,8 @@ void event_handler(const int fd, const short which, void *arg) {
 
 #ifdef TIMETRACE_HANDLE
     if (record) {
-        timetrace_record("[event_handler] End of event_handler in dispatch %d",
-                         thread->worker_id);
+        timetrace_record("[event_handler] End of event_handler in dispatch %d, fd %d",
+                         thread->worker_id, fd);
     }
 #endif
     /* wait for next event */
@@ -6918,6 +6925,20 @@ static void sig_handler(const int sig) {
     return;
 }
 
+// Print timetrace in this function
+// It allows us to dump timetraces in the middle
+static void* timetrace_log(void* args) {
+    timetrace_print();
+    return NULL;
+}
+
+static void sigusr_handler(const int sig) {
+    printf("User defined signal handled: %s. \n", strsignal(sig));
+    pthread_t tid;
+    pthread_create(&tid, NULL, timetrace_log, NULL);
+    return;
+}
+
 #ifndef HAVE_SIGIGNORE
 static int sigignore(int sig) {
     struct sigaction sa = { .sa_handler = SIG_IGN, .sa_flags = 0 };
@@ -7260,6 +7281,9 @@ int main (int argc, char **argv) {
     /* handle SIGINT and SIGTERM */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+
+    /* handle SIGUSR1, dump the timetraces */
+    signal(SIGUSR1, sigusr_handler);
 
     /* setup pthread for libevent */
     evthread_use_pthreads();
