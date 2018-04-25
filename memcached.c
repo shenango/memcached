@@ -6151,7 +6151,7 @@ void event_handler(const int fd, const short which, void *arg) {
     log_corestats();
 #endif
 
-    handled_event = true; // For utilization count
+    // handled_event = true; // For utilization count
 
     c = (conn *)arg;
     assert(c != NULL);
@@ -6198,6 +6198,12 @@ void event_handler(const int fd, const short which, void *arg) {
             fprintf(stderr, "Conn_clsed: %d \n", fd);
             return;
         }
+#ifdef TIMETRACE_HANDLE
+        if (record && thread != NULL) {
+            timetrace_record("[event_handler] Before creating thread in dispatch %d, fd %d",
+                             thread->worker_id, fd);
+        }
+#endif
 
         if ((state == conn_new_cmd) && (trace_sfd == -1)) {
             trace_sfd = fd; // Only track one client
@@ -6207,12 +6213,6 @@ void event_handler(const int fd, const short which, void *arg) {
         c->finished = false;
 
         /* Start Arachne worker thread */
-#ifdef TIMETRACE_HANDLE
-        if (record && thread != NULL) {
-            timetrace_record("[event_handler] Before creating thread in dispatch %d, fd %d",
-                             thread->worker_id, fd);
-        }
-#endif
         arachne_thread_id arachne_tid;
         ret = arachne_thread_create(&arachne_tid, drive_machine, (void*)c);
 //        while (ret != 0) {
