@@ -5858,6 +5858,7 @@ static int server_socket(const char *interface,
         }
 #endif
 
+	setsockopt(sfd, SOL_SOCKET, SO_REUSEPORT, (void *)&flags, sizeof(flags));
         setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
         if (IS_UDP(transport)) {
             maximize_sndbuf(sfd);
