@@ -642,6 +642,7 @@ struct conn {
     short cmd; /* current command being processed */
     int opaque;
     int keylen;
+    uint64_t idx;
     // conn   *next;     /* Used for generating a list of conn structures */
 } __attribute__((aligned(CACHE_LINE_SIZE)));
 

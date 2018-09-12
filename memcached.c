@@ -331,21 +331,21 @@ static int add_msghdr(conn *c)
     return 0;
 }
 
-#if 0
-extern pthread_mutex_t conn_lock;
-
 /* Connection timeout thread bits */
-static pthread_t conn_timeout_tid;
+static mutex_t tcp_conn_lock;
+static conn **active_tcp_conns;
+static uint64_t nactiveconns;
 
 #define CONNS_PER_SLICE 100
-#define TIMEOUT_MSG_SIZE (1 + sizeof(int))
-static void *conn_timeout_thread(void *arg) {
+
+static void conn_timeout_thread(void *arg) {
     int i;
     conn *c;
-    char buf[TIMEOUT_MSG_SIZE];
     rel_time_t oldest_last_cmd;
     int sleep_time;
-    useconds_t timeslice = 1000000 / (max_fds / CONNS_PER_SLICE);
+    useconds_t timeslice = 1000000 / (settings.maxconns / CONNS_PER_SLICE);
+
+    mutex_lock(&tcp_conn_lock);
 
     while(1) {
         if (settings.verbose > 2)
@@ -353,18 +353,20 @@ static void *conn_timeout_thread(void *arg) {
 
         oldest_last_cmd = current_time;
 
-        for (i = 0; i < max_fds; i++) {
+        for (i = 0; i < settings.maxconns; i++) {
             if ((i % CONNS_PER_SLICE) == 0) {
                 if (settings.verbose > 2)
                     fprintf(stderr, "idle timeout thread sleeping for %ulus\n",
                         (unsigned int)timeslice);
-                usleep(timeslice);
+                mutex_unlock(&tcp_conn_lock);
+                timer_sleep(timeslice);
+                mutex_lock(&tcp_conn_lock);
             }
 
-            if (!conns[i])
+            if (!active_tcp_conns[i])
                 continue;
 
-            c = conns[i];
+            c = active_tcp_conns[i];
 
             if (!IS_TCP(c->transport))
                 continue;
@@ -373,11 +375,8 @@ static void *conn_timeout_thread(void *arg) {
                 continue;
 
             if ((current_time - c->last_cmd_time) > settings.idle_timeout) {
-                buf[0] = 't';
-                memcpy(&buf[1], &i, sizeof(int));
-                if (write(c->thread->notify_send_fd, buf, TIMEOUT_MSG_SIZE)
-                    != TIMEOUT_MSG_SIZE)
-                    perror("Failed to write timeout to notify pipe");
+                log_debug("Aborting idle connection with port %d", tcp_remote_addr(c->tcp_conn).port);
+                tcp_abort(c->tcp_conn);
             } else {
                 if (c->last_cmd_time < oldest_last_cmd)
                     oldest_last_cmd = c->last_cmd_time;
@@ -393,12 +392,17 @@ static void *conn_timeout_thread(void *arg) {
             fprintf(stderr,
                     "idle timeout thread finished pass, sleeping for %ds\n",
                     sleep_time);
-        usleep((useconds_t) sleep_time * 1000000);
+        mutex_unlock(&tcp_conn_lock);
+        timer_sleep((useconds_t) sleep_time * 1000000);
+        mutex_lock(&tcp_conn_lock);
     }
 
-    return NULL;
+    mutex_unlock(&tcp_conn_lock);
+
 }
 
+
+#if 0
 static int start_conn_timeout_thread() {
     int ret;
 
@@ -832,6 +836,14 @@ static void conn_close(conn *c) {
         udp_spawn_data_release(c->spawn_data->release_data);
         tcache_free(&udp_conn_tcache_pt, c);
     } else {
+        mutex_lock(&tcp_conn_lock);
+        conn *last_conn = active_tcp_conns[nactiveconns - 1];
+        active_tcp_conns[nactiveconns - 1] = NULL;
+        active_tcp_conns[c->idx] = last_conn;
+        if (last_conn)
+            last_conn->idx = c->idx;
+        nactiveconns--;
+        mutex_unlock(&tcp_conn_lock);
         conn_set_state(c, conn_read);
         tcp_abort(c->tcp_conn);
         tcp_close(c->tcp_conn);
@@ -5007,6 +5019,7 @@ static int try_read_command(conn *c) {
             c->opaque = c->binary_header.request.opaque;
             /* clear the returned cas value */
             c->cas = 0;
+            c->last_cmd_time = current_time;
 
             dispatch_bin_command(c);
 
@@ -5710,14 +5723,32 @@ static void handle_tcp_conn(void *arg)
 {
     tcpconn_t *tconn = arg;
     conn *c = tcache_alloc(&tcp_conn_tcache_pt);
-    if (!c) {
-        tcp_abort(tconn);
-        tcp_close(tconn);
-        return;
+    if (!c)
+        goto abort_conn;
+
+    c->last_cmd_time = current_time;
+    c->tcp_conn = tconn;
+
+
+    mutex_lock(&tcp_conn_lock);
+    if (nactiveconns == settings.maxconns) {
+        mutex_unlock(&tcp_conn_lock);
+        log_err("MAX CONNS REACHED");
+        tcache_free(&tcp_conn_tcache_pt, c);
+        goto abort_conn;
     }
 
-    c->tcp_conn = tconn;
+    c->idx = nactiveconns++;
+    active_tcp_conns[c->idx] = c;
+    mutex_unlock(&tcp_conn_lock);
+
     drive_machine(c);
+
+    return;
+
+abort_conn:
+    tcp_abort(tconn);
+    tcp_close(tconn);
 }
 
 static void udp_handler(struct udp_spawn_data *d) {
@@ -7745,6 +7776,16 @@ static void memcached_main(void *arg)
 #endif
 
     timer_sleep(1000);
+
+    active_tcp_conns = calloc(settings.maxconns, sizeof(conn *));
+    if (!active_tcp_conns) {
+        abort();
+    }
+
+    mutex_init(&tcp_conn_lock);
+
+    if (settings.idle_timeout)
+        thread_spawn(conn_timeout_thread, NULL);
 
     if (pid_file != NULL) {
         save_pid(pid_file);
