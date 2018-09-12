@@ -1,0 +1,26 @@
+From 5ad801f4a3f9113dcba157898c7180b78b455d72 Mon Sep 17 00:00:00 2001
+From: Josh Fried <joshuafried@gmail.com>
+Date: Wed, 5 Sep 2018 14:52:05 -0400
+Subject: [PATCH] numinate
+
+---
+ src/CoreArbiterServer.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/CoreArbiterServer.cc b/src/CoreArbiterServer.cc
+index 6865376..1f63317 100644
+--- a/src/CoreArbiterServer.cc
++++ b/src/CoreArbiterServer.cc
+@@ -123,7 +123,8 @@ CoreArbiterServer::CoreArbiterServer(std::string socketPath,
+             // the arbiter has something to run on.
+             managedCoreIds.clear();
+             for (int id = 1; id < static_cast<int>(numCores); id++) {
+-                managedCoreIds.push_back(id);
++	      if (id % 2 == 0)
++		managedCoreIds.push_back(id);
+             }
+             alwaysUnmanagedString = "0,";
+         } else {
+-- 
+2.14.1
+
