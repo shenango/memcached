@@ -18,6 +18,7 @@ pushd arachne-all
 cd CoreArbiter
 git checkout 9bd2ddbd14cadd08a70c7d159fc95882dce4d680
 git am ${MEMCACHED_DIR}/CoreArbiter.patch
+git am ${MEMCACHED_DIR}/corerestrict.patch
 cd ../
 
 ./buildAll.sh

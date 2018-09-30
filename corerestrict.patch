@@ -1,0 +1,24 @@
+From 50a543db37779b64d08774b886170f35eac9cb45 Mon Sep 17 00:00:00 2001
+From: Josh Fried <joshuafried@gmail.com>
+Date: Sun, 30 Sep 2018 10:49:48 -0400
+Subject: [PATCH] restrict to 16 threads on zig/zag
+
+---
+ src/CoreArbiterServer.cc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/CoreArbiterServer.cc b/src/CoreArbiterServer.cc
+index 1f63317..0fe7b21 100644
+--- a/src/CoreArbiterServer.cc
++++ b/src/CoreArbiterServer.cc
+@@ -123,6 +123,7 @@ CoreArbiterServer::CoreArbiterServer(std::string socketPath,
+             // the arbiter has something to run on.
+             managedCoreIds.clear();
+             for (int id = 1; id < static_cast<int>(numCores); id++) {
++		if (( id > 14 && id < 24) || id > 38) continue;
+ 	      if (id % 2 == 0)
+ 		managedCoreIds.push_back(id);
+             }
+-- 
+2.14.1
+
