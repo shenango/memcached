@@ -70,8 +70,6 @@
 
 static struct tcache *udp_conn_tcache;
 static __thread struct tcache_perthread udp_conn_tcache_pt;
-static struct tcache *tcp_conn_tcache;
-static __thread struct tcache_perthread tcp_conn_tcache_pt;
 
 /*
  * forward declarations
@@ -535,6 +533,7 @@ conn *conn_new(enum conn_states init_state,
         c->iov = 0;
         c->msglist = 0;
         c->hdrbuf = 0;
+        c->idx = -1;
 
         c->rsize = read_buffer_size;
         c->wsize = DATA_BUFFER_SIZE;
@@ -763,6 +762,7 @@ void conn_free(conn *c) {
             free(c->suffixlist);
         if (c->iov)
             free(c->iov);
+        BUG_ON(c->idx != -1);
         free(c);
     }
 }
@@ -787,28 +787,9 @@ static int udp_conn_tcache_alloc(struct tcache *tc, int nr, void **items)
     return 0;
 }
 
-static int tcp_conn_tcache_alloc(struct tcache *tc, int nr, void **items)
-{
-    int i;
-
-    for (i = 0; i < nr; i++) {
-        items[i] = conn_new(conn_read, DATA_BUFFER_SIZE, tcp_transport);
-        if (items[i] == NULL) {
-            conn_tcache_free(tc, i, items);
-            return -ENOMEM;
-        }
-    }
-    return 0;
-}
-
 static const struct tcache_ops udp_conn_tcache_ops = {
     .alloc = udp_conn_tcache_alloc, .free = conn_tcache_free,
 };
-
-static const struct tcache_ops tcp_conn_tcache_ops = {
-    .alloc = tcp_conn_tcache_alloc, .free = conn_tcache_free,
-};
-
 
 static void conn_close(conn *c) {
     assert(c != NULL);
@@ -837,17 +818,15 @@ static void conn_close(conn *c) {
         tcache_free(&udp_conn_tcache_pt, c);
     } else {
         mutex_lock(&tcp_conn_lock);
-        conn *last_conn = active_tcp_conns[nactiveconns - 1];
-        active_tcp_conns[nactiveconns - 1] = NULL;
-        active_tcp_conns[c->idx] = last_conn;
-        if (last_conn)
-            last_conn->idx = c->idx;
-        nactiveconns--;
+        active_tcp_conns[c->idx] = active_tcp_conns[--nactiveconns];
+        active_tcp_conns[nactiveconns] = NULL;
+        if (active_tcp_conns[c->idx])
+            active_tcp_conns[c->idx]->idx = c->idx;
+        c->idx = -1;
         mutex_unlock(&tcp_conn_lock);
-        conn_set_state(c, conn_read);
         tcp_abort(c->tcp_conn);
         tcp_close(c->tcp_conn);
-        tcache_free(&tcp_conn_tcache_pt, c);
+        conn_free(c);
     }
 
     return;
@@ -5722,7 +5701,7 @@ void drive_machine(void *arg) {
 static void handle_tcp_conn(void *arg)
 {
     tcpconn_t *tconn = arg;
-    conn *c = tcache_alloc(&tcp_conn_tcache_pt);
+    conn *c = conn_new(conn_read, DATA_BUFFER_SIZE, tcp_transport);
     if (!c)
         goto abort_conn;
 
@@ -5734,7 +5713,7 @@ static void handle_tcp_conn(void *arg)
     if (nactiveconns == settings.maxconns) {
         mutex_unlock(&tcp_conn_lock);
         log_err("MAX CONNS REACHED");
-        tcache_free(&tcp_conn_tcache_pt, c);
+        conn_free(c);
         goto abort_conn;
     }
 
@@ -7649,9 +7628,6 @@ static int memcached_init(void) {
     udp_conn_tcache = tcache_create("udp_conn_tcache", &udp_conn_tcache_ops,
                                 TCACHE_DEFAULT_MAG_SIZE, sizeof(conn));
     BUG_ON(udp_conn_tcache == NULL);
-    tcp_conn_tcache = tcache_create("tcp_conn_tcache", &tcp_conn_tcache_ops,
-                                TCACHE_DEFAULT_MAG_SIZE, sizeof(conn));
-    BUG_ON(tcp_conn_tcache == NULL);
 
     return 0;
 }
@@ -7862,7 +7838,6 @@ int perthread_initializer(void);
 int perthread_initializer(void)
 {
     tcache_init_perthread(udp_conn_tcache, &udp_conn_tcache_pt);
-    tcache_init_perthread(tcp_conn_tcache, &tcp_conn_tcache_pt);
 
     return memcached_perthread_init();
 }
