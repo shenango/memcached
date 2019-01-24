@@ -6550,7 +6550,7 @@ static struct rlimit rlim;
 static bool protocol_specified = false;
 static bool start_lru_maintainer = true;
 static bool start_lru_crawler = true;
-static bool start_assoc_maint = true;
+static bool start_assoc_maint = false; // we don't support hashexpand
 static enum hashfunc_type hash_type = MURMUR3_HASH;
 static char *slab_sizes_unparsed = NULL;
 static bool slab_chunk_size_changed = false;
