@@ -11,15 +11,32 @@ cd $MEMCACHED_DIR
 ARACHNE_DIR=${MEMCACHED_DIR}/arachne-all
 echo "Installing arachne-all to ${ARACHNE_DIR}"
 
-git clone --recursive https://github.com/PlatformLab/arachne-all.git ${ARACHNE_DIR}
 pushd arachne-all
 
-# Use working version
-cd CoreArbiter
-git checkout 9bd2ddbd14cadd08a70c7d159fc95882dce4d680
-git am ${MEMCACHED_DIR}/CoreArbiter.patch
-git am ${MEMCACHED_DIR}/corerestrict.patch
-cd ../
+git clone https://github.com/PlatformLab/Arachne.git
+pushd Arachne
+git checkout 3ce620af12b6013d49491742d94560e08504579e
+popd
+
+git clone https://github.com/PlatformLab/ArachnePerfTests.git
+pushd ArachnePerfTests
+git checkout 8ebd283beec910d133add6f8a148eca4186eb327
+popd
+
+git clone https://github.com/PlatformLab/CoreArbiter.git
+pushd CoreArbiter
+git checkout 6c7b6e3992c7996267ccca8a338e73b59a6d36a1
+popd
+
+git clone https://github.com/google/googletest.git
+pushd googletest
+git checkout 4bab34d2084259cba67f3bfb51217c10d606e175
+popd
+
+git clone https://github.com/PlatformLab/PerfUtils.git
+pushd PerfUtils
+git checkout 1de07f3e956cc4d679220cac9016710f33c054be
+popd
 
 ./buildAll.sh
 popd
