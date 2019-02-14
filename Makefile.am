@@ -1,6 +1,6 @@
 bin_PROGRAMS = memcached
 pkginclude_HEADERS = protocol_binary.h
-noinst_PROGRAMS = memcached-debug sizes testapp timedrun
+#noinst_PROGRAMS = memcached-debug sizes testapp timedrun
 
 BUILT_SOURCES=
 
@@ -54,11 +54,13 @@ memcached_SOURCES += extstore.c extstore.h \
 endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
-memcached_CPPFLAGS = -DNDEBUG
-memcached_debug_LDADD = @PROFILER_LDFLAGS@
+memcached_CPPFLAGS = -DNDEBUG $(SHEN_CPPFLAGS)
+memcached_debug_LDADD = @PROFILER_LDFLAGS@ $(SHEN_LIBS)
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
 
-memcached_LDADD =
+memcached_CFLAGS = $(SHEN_CPPFLAGS)
+memcached_LDFLAGS = $(SHEN_LDFLAGS)
+memcached_LDADD = $(SHEN_LIBS)
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =
 CLEANFILES=
