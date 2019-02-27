@@ -1,0 +1,15 @@
+[submodule "arachne-all/Arachne"]
+	path = arachne-all/Arachne
+	url = https://github.com/PlatformLab/Arachne.git
+[submodule "arachne-all/ArachnePerfTests"]
+	path = arachne-all/ArachnePerfTests
+	url = https://github.com/PlatformLab/ArachnePerfTests.git
+[submodule "arachne-all/CoreArbiter"]
+	path = arachne-all/CoreArbiter
+	url = https://github.com/PlatformLab/CoreArbiter.git
+[submodule "arachne-all/googletest"]
+	path = arachne-all/googletest
+	url = https://github.com/google/googletest.git
+[submodule "arachne-all/PerfUtils"]
+	path = arachne-all/PerfUtils
+	url = https://github.com/PlatformLab/PerfUtils.git

@@ -43,8 +43,3 @@ doc/protocol-binary.txt
 /memcached.spec
 .*.swp
 /compile_commands.json
-arachne-all/Arachne/
-arachne-all/ArachnePerfTests/
-arachne-all/CoreArbiter/
-arachne-all/PerfUtils/
-arachne-all/googletest/
