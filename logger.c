@@ -382,7 +382,7 @@ static int flush_udp(unsigned char *data, unsigned int data_size, conn *c)
 {
     int total = data_size, ret, tosend, done = 0;
     do {
-        tosend = min(data_size - done, UDP_MAX_PAYLOAD);
+        tosend = MIN(data_size - done, UDP_MAX_PAYLOAD);
         ret = udp_respond(data + done, tosend, c->spawn_data);
         if (ret < 0 || ret != tosend) {
             total = ret;

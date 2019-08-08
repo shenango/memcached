@@ -314,7 +314,7 @@ static int lru_crawler_poll(crawler_client_t *c) {
             if (IS_UDP(((conn *)c->c)->transport)) {
                 int ret, tosend, done = 0;
                 do {
-                    tosend = min(data_size - done, UDP_MAX_PAYLOAD);
+                    tosend = MIN(data_size - done, UDP_MAX_PAYLOAD);
                     ret = udp_respond(data + done, tosend, ((conn *)c->c)->spawn_data);
                     if (ret > 0)
                         total += ret;

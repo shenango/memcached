@@ -11,6 +11,7 @@
 #include <runtime/thread.h>
 #include <runtime/timer.h>
 #include <runtime/udp.h>
+#include <runtime/runtime.h>
 
 #undef assert
 #define assert(x) BUG_ON(!(x))
