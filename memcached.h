@@ -654,12 +654,12 @@ inline PHYS_THREAD *mythr(void)
     return mythr_ptr;
 }
 
-inline void STATS_LOCAL_LOCK(void)
+static inline void STATS_LOCAL_LOCK(void)
 {
 	mutex_lock(&mythr()->stats.mutex);
 }
 
-inline void STATS_LOCAL_UNLOCK(void)
+static inline void STATS_LOCAL_UNLOCK(void)
 {
 	mutex_unlock(&mythr()->stats.mutex);
 }
