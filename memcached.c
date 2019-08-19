@@ -6545,7 +6545,7 @@ static bool preallocate = false;
 static int maxcore = 0;
 static char *username = NULL;
 static char *pid_file = NULL;
-static struct passwd *pw;
+//static struct passwd *pw;
 static struct rlimit rlim;
 static bool protocol_specified = false;
 static bool start_lru_maintainer = true;
@@ -7556,7 +7556,7 @@ static int memcached_init(void) {
         }
     }
 
-
+#if 0
     /* lose root privileges if we have them */
     if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
@@ -7572,7 +7572,7 @@ static int memcached_init(void) {
             return -EX_OSERR;
         }
     }
-
+#endif
     /* Initialize Sasl if -S was specified */
     if (settings.sasl) {
         init_sasl();
