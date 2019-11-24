@@ -6906,21 +6906,7 @@ static void arg_parse(void *arg)
             }
             break;
         case 't':
-            settings.num_threads = atoi(optarg);
-            if (settings.num_threads <= 0) {
-                fprintf(stderr, "Number of threads must be greater than 0\n");
-                exit(1);
-            }
-            /* There're other problems when you get above 64 threads.
-             * In the future we should portably detect # of cores for the
-             * default.
-             */
-            if (settings.num_threads > 64) {
-                fprintf(stderr, "WARNING: Setting a high number of worker"
-                                "threads is not recommended.\n"
-                                " Set this value to the number of cores in"
-                                " your machine or less.\n");
-            }
+            fprintf(stderr, "WARNING: thread setting is controlled by shenango config file\n");
             break;
         case 'D':
             if (! optarg || ! optarg[0]) {
@@ -7526,6 +7512,9 @@ static void validate_settings(void)
 
 
 static int memcached_init(void) {
+
+    /* Set threads based on max kthreads */
+    settings.num_threads = runtime_max_cores();
 
     /* Run regardless of initializing it later */
     init_lru_maintainer();
