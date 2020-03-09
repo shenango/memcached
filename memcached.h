@@ -548,6 +548,15 @@ typedef struct _io_wrap {
     bool active; // FIXME: canary for test. remove
 } io_wrap;
 #endif
+
+struct TcpRef {
+    mutex_t lock;
+    atomic_t ref_cnt;
+    tcpconn_t *conn;
+};
+
+void tcpref_put(struct TcpRef *t);
+
 /**
  * The structure representing a connection into memcached.
  */
@@ -621,7 +630,8 @@ struct conn {
     int    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
     union {
         struct udp_spawn_data *spawn_data;
-        tcpconn_t *tcp_conn;
+        // tcpconn_t *tcp_conn;
+        struct TcpRef *tcpref;
     };
     
     unsigned char *hdrbuf; /* udp packet headers */
@@ -642,8 +652,6 @@ struct conn {
     short cmd; /* current command being processed */
     int opaque;
     int keylen;
-    uint64_t idx;
-    // conn   *next;     /* Used for generating a list of conn structures */
 } __attribute__((aligned(CACHE_LINE_SIZE)));
 
 extern __thread PHYS_THREAD *mythr_ptr;

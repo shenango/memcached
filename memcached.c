@@ -102,6 +102,8 @@ static void conn_close(conn *c);
 conn *conn_new(enum conn_states init_state,
                 const int read_buffer_size,
                 enum network_transport transport);
+void conn_reset(conn *c, enum conn_states init_state, enum network_transport transport);
+
 static void complete_nread(conn *c);
 static void process_command(conn *c, char *command);
 static void write_and_free(conn *c, char *buf, int bytes);
@@ -243,7 +245,7 @@ static void settings_init(void) {
     settings.detail_enabled = 0;
     settings.reqs_per_event = 20;
     settings.backlog = 1024;
-    settings.binding_protocol = negotiating_prot;
+    settings.binding_protocol = binary_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
     settings.slab_page_size = 1024 * 1024; /* chunks are split from 1MB pages. */
     settings.slab_chunk_size_max = settings.slab_page_size / 2;
@@ -329,6 +331,7 @@ static int add_msghdr(conn *c)
     return 0;
 }
 
+#if 0
 /* Connection timeout thread bits */
 static mutex_t tcp_conn_lock;
 static conn **active_tcp_conns;
@@ -400,7 +403,6 @@ static void conn_timeout_thread(void *arg) {
 }
 
 
-#if 0
 static int start_conn_timeout_thread() {
     int ret;
 
@@ -512,21 +514,56 @@ void conn_worker_readd(conn *c) {
 }
 #endif
 
+void conn_reset(conn *c, enum conn_states init_state, enum network_transport transport)
+{
+    c->state = init_state;
+    c->rlbytes = 0;
+    c->cmd = -1;
+    c->rbytes = c->wbytes = 0;
+    c->wcurr = c->wbuf;
+    c->rcurr = c->rbuf;
+    // BUG_ON(c->ritem);
+    c->ritem = 0;
+    c->icurr = c->ilist;
+    c->suffixcurr = c->suffixlist;
+    c->ileft = 0;
+    c->suffixleft = 0;
+    c->iovused = 0;
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->authenticated = false;
+    c->last_cmd_time = current_time; /* initialize for idle kicker */
+
+    c->write_and_go = init_state;
+    BUG_ON(c->write_and_free);
+//    c->write_and_free = 0;
+    BUG_ON(c->item);
+    BUG_ON(c->sbytes);
+    // BUG_ON(c->msgbytes);
+    // c->item = 0;
+
+    c->msgbytes = 0;
+
+    c->noreply = false;
+    c->transport = transport;
+}
+
 conn *conn_new(enum conn_states init_state,
                 const int read_buffer_size,
                 enum network_transport transport) {
     conn *c;
 
-        if (!(c = (conn *)aligned_alloc(CACHE_LINE_SIZE, sizeof(conn)))) {
-            STATS_LOCK();
-            stats.malloc_fails++;
-            STATS_UNLOCK();
-            fprintf(stderr, "Failed to allocate connection object\n");
-            return NULL;
-        }
-        memset(c, 0, sizeof(conn));
-        MEMCACHED_CONN_CREATE(c);
+    if (!(c = (conn *)aligned_alloc(CACHE_LINE_SIZE, sizeof(conn)))) {
+        STATS_LOCK();
+        stats.malloc_fails++;
+        STATS_UNLOCK();
+        fprintf(stderr, "Failed to allocate connection object\n");
+        return NULL;
+    }
+    memset(c, 0, sizeof(conn));
+    MEMCACHED_CONN_CREATE(c);
 
+#if 0
         c->rbuf = c->wbuf = 0;
         c->ilist = 0;
         c->suffixlist = 0;
@@ -534,7 +571,7 @@ conn *conn_new(enum conn_states init_state,
         c->msglist = 0;
         c->hdrbuf = 0;
         c->idx = -1;
-
+#endif
         c->rsize = read_buffer_size;
         c->wsize = DATA_BUFFER_SIZE;
         c->isize = ITEM_LIST_INITIAL;
@@ -762,7 +799,7 @@ void conn_free(conn *c) {
             free(c->suffixlist);
         if (c->iov)
             free(c->iov);
-        BUG_ON(c->idx != -1);
+        // BUG_ON(c->idx != -1);
         free(c);
     }
 }
@@ -813,10 +850,11 @@ static void conn_close(conn *c) {
     MEMCACHED_CONN_RELEASE(c);
 
     if (likely(IS_UDP(c->transport))) {
-        conn_set_state(c, conn_parse_cmd);
+        // conn_set_state(c, conn_parse_cmd);
         udp_spawn_data_release(c->spawn_data->release_data);
         tcache_free(&udp_conn_tcache_pt, c);
     } else {
+#if 0
         mutex_lock(&tcp_conn_lock);
         active_tcp_conns[c->idx] = active_tcp_conns[--nactiveconns];
         active_tcp_conns[nactiveconns] = NULL;
@@ -827,6 +865,9 @@ static void conn_close(conn *c) {
         tcp_abort(c->tcp_conn);
         tcp_close(c->tcp_conn);
         conn_free(c);
+#endif
+        tcpref_put(c->tcpref);
+        tcache_free(&udp_conn_tcache_pt, c);
     }
 
     return;
@@ -2682,11 +2723,12 @@ static void reset_cmd_handler(conn *c) {
     conn_shrink(c);
     if (c->rbytes > 0) {
         conn_set_state(c, conn_parse_cmd);
-    } else if (IS_UDP(c->transport)) {
+    } else { //} if (IS_UDP(c->transport)) {
         conn_set_state(c, conn_closing);
-    } else {
-        conn_set_state(c, conn_read);
     }
+    // } else {
+        // conn_set_state(c, conn_read);
+    // }
 }
 
 static void complete_nread(conn *c) {
@@ -5106,6 +5148,7 @@ static enum try_read_result try_read_udp(conn *c) {
  * @return enum try_read_result
  */
 static enum try_read_result try_read_network(conn *c) {
+    BUG();
     enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     ssize_t res;
     int num_allocs = 0;
@@ -5140,7 +5183,7 @@ static enum try_read_result try_read_network(conn *c) {
             c->rsize *= 2;
         }
         int avail = c->rsize - c->rbytes;
-        res = tcp_read(c->tcp_conn, c->rbuf + c->rbytes, avail);
+        // res = tcp_read(c->tcp_conn, c->rbuf + c->rbytes, avail);
         if (res > 0) {
             STATS_LOCAL_LOCK();
             mythr()->stats.bytes_read += res;
@@ -5237,6 +5280,11 @@ void do_accept_new_conns(const bool do_accept) {
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
 
+    struct TcpRef *t = c->tcpref;
+    if (!IS_UDP(c->transport))
+        mutex_lock(&t->lock);
+
+again:
     if (c->msgcurr < c->msgused &&
             c->msglist[c->msgcurr].msg_iovlen == 0) {
         /* Finished writing the current msg; advance to the next. */
@@ -5247,8 +5295,10 @@ static enum transmit_result transmit(conn *c) {
         struct msghdr *m = &c->msglist[c->msgcurr];
         if (IS_UDP(c->transport))
             res = udp_respondv(m->msg_iov, m->msg_iovlen, c->spawn_data);
-        else
-            res = tcp_writev(c->tcp_conn, m->msg_iov, m->msg_iovlen);
+        else {
+
+            res = tcp_writev(t->conn, m->msg_iov, m->msg_iovlen);
+        }
         if (res > 0) {
             STATS_LOCAL_LOCK();
             mythr()->stats.bytes_written += res;
@@ -5268,15 +5318,24 @@ static enum transmit_result transmit(conn *c) {
                 m->msg_iov->iov_base = (caddr_t)m->msg_iov->iov_base + res;
                 m->msg_iov->iov_len -= res;
             }
-            return TRANSMIT_INCOMPLETE;
+            goto again;
+//            return TRANSMIT_INCOMPLETE;
         }
 
         if (res == -105)
-            return TRANSMIT_SOFT_ERROR;
+            goto again;
+//            return TRANSMIT_SOFT_ERROR;
+
+        if (!IS_UDP(c->transport))
+            mutex_unlock(&t->lock);
 
         conn_set_state(c, conn_closing);
         return TRANSMIT_HARD_ERROR;
     } else {
+
+        if (!IS_UDP(c->transport))
+            mutex_unlock(&t->lock);
+
         return TRANSMIT_COMPLETE;
     }
 }
@@ -5330,12 +5389,13 @@ static int read_into_chunked_item(conn *c) {
                 break;
             }
         } else {
+            BUG();
             /*  now try reading from the socket */
             if (IS_UDP(c->transport)) {
                 res = 0;
             } else {
-                res = tcp_read(c->tcp_conn, ch->data + ch->used,
-                                    (unused > c->rlbytes ? c->rlbytes : unused));
+                // res = tcp_read(c->tcp_conn, ch->data + ch->used,
+                                    // (unused > c->rlbytes ? c->rlbytes : unused));
             }
             if (res > 0) {
                 STATS_LOCAL_LOCK();
@@ -5528,11 +5588,12 @@ void drive_machine(void *arg) {
                         break;
                     }
                 }
+                BUG();
                 /*  now try reading from the socket */
                 if (IS_UDP(c->transport)) {
                     res = 0;
                 } else {
-                    res = tcp_read(c->tcp_conn, c->ritem, c->rlbytes);
+                    // res = tcp_read(c->tcp_conn, c->ritem, c->rlbytes);
                 }
                 if (res > 0) {
                     STATS_LOCAL_LOCK();
@@ -5698,9 +5759,74 @@ void drive_machine(void *arg) {
     return;
 }
 
+void tcpref_put(struct TcpRef *t) {
+    if (atomic_dec_and_test(&t->ref_cnt)) {
+        tcp_abort(t->conn);
+        tcp_close(t->conn);
+        sfree(t);
+    }
+}
+
+
+static ssize_t read_full(tcpconn_t *c, void *buf, size_t len)
+{
+    size_t pos = 0;
+    do {
+        ssize_t ret = tcp_read(c, buf + pos, len - pos);
+        if (ret <= 0)
+            return ret;
+        pos += ret;
+    } while (pos < len);
+    return len;
+}
+
 static void handle_tcp_conn(void *arg)
 {
     tcpconn_t *tconn = arg;
+    conn *c = NULL;
+    struct TcpRef *t = NULL;
+
+    t = smalloc(sizeof(*t));
+    if (!t) {
+        tcp_abort(tconn);
+        tcp_close(tconn);
+        return;
+    }
+
+    mutex_init(&t->lock);
+    atomic_write(&t->ref_cnt, 1);
+    t->conn = tconn;
+
+
+    while (true) {
+        c = tcache_alloc(&udp_conn_tcache_pt);
+        if (!c)
+            goto abort_conn;
+        conn_reset(c, conn_parse_cmd, tcp_transport);
+
+        protocol_binary_request_header *hdr = (protocol_binary_request_header *)c->rbuf;
+
+        if (read_full(tconn, hdr, sizeof(*hdr)) <= 0)
+            goto abort_conn;
+
+        uint32_t body_len = ntoh32(hdr->request.bodylen);
+        if (read_full(tconn, c->rbuf + sizeof(*hdr), body_len) <= 0)
+            goto abort_conn;
+
+        c->rbytes = sizeof(*hdr) + body_len;
+
+        c->tcpref = t;
+        atomic_inc(&t->ref_cnt);
+
+        thread_spawn(drive_machine, c);
+
+    }
+
+#if 0
+
+    conn_reset(c, conn_read, tcp_transport);
+
+
     conn *c = conn_new(conn_read, DATA_BUFFER_SIZE, tcp_transport);
     if (!c)
         goto abort_conn;
@@ -5724,10 +5850,13 @@ static void handle_tcp_conn(void *arg)
     drive_machine(c);
 
     return;
+#endif
 
 abort_conn:
-    tcp_abort(tconn);
-    tcp_close(tconn);
+    if (t)
+        tcpref_put(t);
+    if (c)
+        tcache_free(&udp_conn_tcache_pt, c);
 }
 
 static void udp_handler(struct udp_spawn_data *d) {
@@ -5739,6 +5868,8 @@ static void udp_handler(struct udp_spawn_data *d) {
         udp_spawn_data_release(d->release_data);
         return;
     }
+
+    conn_reset(c, conn_parse_cmd, udp_transport);
 
     c->spawn_data = d;
 
@@ -7623,6 +7754,7 @@ static int memcached_init(void) {
 
 static void memcached_main(void *arg)
 {
+
     int ret;
     /* initialize other stuff */
    if (start_logger_thread() != 0) {
@@ -7742,24 +7874,26 @@ static void memcached_main(void *arg)
 
     timer_sleep(1000);
 
-    active_tcp_conns = calloc(settings.maxconns, sizeof(conn *));
-    if (!active_tcp_conns) {
-        abort();
-    }
+    // active_tcp_conns = calloc(settings.maxconns, sizeof(conn *));
+    // if (!active_tcp_conns) {
+        // abort();
+    // }
 
-    mutex_init(&tcp_conn_lock);
+    // mutex_init(&tcp_conn_lock);
 
-    if (settings.idle_timeout)
-        thread_spawn(conn_timeout_thread, NULL);
+    // if (settings.idle_timeout)
+        // thread_spawn(conn_timeout_thread, NULL);
 
     if (pid_file != NULL) {
         save_pid(pid_file);
     }
 
+#if 0
     /* Drop privileges no longer needed */
     if (settings.drop_privileges) {
         drop_privileges();
     }
+#endif
 
     /* Initialize the uriencode lookup table. */
     uriencode_init();
