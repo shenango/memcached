@@ -5760,6 +5760,7 @@ static void memcached_handler(struct srpc_ctx *ctx)
     conn_reset(c, conn_parse_cmd, tcp_transport);
 
     c->rbuf = ctx->req_buf;
+    c->rcurr = c->rbuf;
     c->rbytes = ctx->req_len;
     c->out = ctx->resp_buf;
 
