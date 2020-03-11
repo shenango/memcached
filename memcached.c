@@ -866,7 +866,6 @@ static void conn_close(conn *c) {
         tcp_close(c->tcp_conn);
         conn_free(c);
 #endif
-        tcpref_put(c->tcpref);
         tcache_free(&udp_conn_tcache_pt, c);
     }
 
@@ -5280,10 +5279,6 @@ void do_accept_new_conns(const bool do_accept) {
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
 
-    struct TcpRef *t = c->tcpref;
-    if (!IS_UDP(c->transport))
-        mutex_lock(&t->lock);
-
 again:
     if (c->msgcurr < c->msgused &&
             c->msglist[c->msgcurr].msg_iovlen == 0) {
@@ -5296,8 +5291,12 @@ again:
         if (IS_UDP(c->transport))
             res = udp_respondv(m->msg_iov, m->msg_iovlen, c->spawn_data);
         else {
-
-            res = tcp_writev(t->conn, m->msg_iov, m->msg_iovlen);
+            // TODO: replace iovector to output buffer.
+            res = 0;
+            for(int i = 0; i < m->msg_iovlen; ++i) {
+                memcpy(c->out + res, m->msg_iov[i].iov_base, m->msg_iov[i].iov_len);
+		res += m->msg_iov[i].iov_len;
+	    }
         }
         if (res > 0) {
             STATS_LOCAL_LOCK();
@@ -5326,16 +5325,9 @@ again:
             goto again;
 //            return TRANSMIT_SOFT_ERROR;
 
-        if (!IS_UDP(c->transport))
-            mutex_unlock(&t->lock);
-
         conn_set_state(c, conn_closing);
         return TRANSMIT_HARD_ERROR;
     } else {
-
-        if (!IS_UDP(c->transport))
-            mutex_unlock(&t->lock);
-
         return TRANSMIT_COMPLETE;
     }
 }
@@ -5759,104 +5751,21 @@ void drive_machine(void *arg) {
     return;
 }
 
-void tcpref_put(struct TcpRef *t) {
-    if (atomic_dec_and_test(&t->ref_cnt)) {
-        tcp_abort(t->conn);
-        tcp_close(t->conn);
-        sfree(t);
-    }
-}
-
-
-static ssize_t read_full(tcpconn_t *c, void *buf, size_t len)
+// Per-request handler
+static void memcached_handler(struct srpc_ctx *ctx)
 {
-    size_t pos = 0;
-    do {
-        ssize_t ret = tcp_read(c, buf + pos, len - pos);
-        if (ret <= 0)
-            return ret;
-        pos += ret;
-    } while (pos < len);
-    return len;
-}
-
-static void handle_tcp_conn(void *arg)
-{
-    tcpconn_t *tconn = arg;
-    conn *c = NULL;
-    struct TcpRef *t = NULL;
-
-    t = smalloc(sizeof(*t));
-    if (!t) {
-        tcp_abort(tconn);
-        tcp_close(tconn);
-        return;
-    }
-
-    mutex_init(&t->lock);
-    atomic_write(&t->ref_cnt, 1);
-    t->conn = tconn;
-
-
-    while (true) {
-        c = tcache_alloc(&udp_conn_tcache_pt);
-        if (!c)
-            goto abort_conn;
-        conn_reset(c, conn_parse_cmd, tcp_transport);
-
-        protocol_binary_request_header *hdr = (protocol_binary_request_header *)c->rbuf;
-
-        if (read_full(tconn, hdr, sizeof(*hdr)) <= 0)
-            goto abort_conn;
-
-        uint32_t body_len = ntoh32(hdr->request.bodylen);
-        if (read_full(tconn, c->rbuf + sizeof(*hdr), body_len) <= 0)
-            goto abort_conn;
-
-        c->rbytes = sizeof(*hdr) + body_len;
-
-        c->tcpref = t;
-        atomic_inc(&t->ref_cnt);
-
-        thread_spawn(drive_machine, c);
-
-    }
-
-#if 0
-
-    conn_reset(c, conn_read, tcp_transport);
-
-
-    conn *c = conn_new(conn_read, DATA_BUFFER_SIZE, tcp_transport);
+    conn *c = tcache_alloc(&udp_conn_tcache_pt);
     if (!c)
-        goto abort_conn;
+        return;
+    conn_reset(c, conn_parse_cmd, tcp_transport);
 
-    c->last_cmd_time = current_time;
-    c->tcp_conn = tconn;
-
-
-    mutex_lock(&tcp_conn_lock);
-    if (nactiveconns == settings.maxconns) {
-        mutex_unlock(&tcp_conn_lock);
-        log_err("MAX CONNS REACHED");
-        conn_free(c);
-        goto abort_conn;
-    }
-
-    c->idx = nactiveconns++;
-    active_tcp_conns[c->idx] = c;
-    mutex_unlock(&tcp_conn_lock);
+    c->rbuf = ctx->req_buf;
+    c->rbytes = ctx->req_len;
+    c->out = ctx->resp_buf;
 
     drive_machine(c);
 
-    return;
-#endif
-
-abort_conn:
-    if (t)
-        tcpref_put(t);
-    if (c)
-        tcache_free(&udp_conn_tcache_pt, c);
+    ctx->resp_len = c->msgbytes;
 }
 
 static void udp_handler(struct udp_spawn_data *d) {
@@ -7912,22 +7821,8 @@ static void memcached_main(void *arg)
     }
 
     if (settings.port) {
-        struct netaddr l_tcp = {
-            .ip = 0,
-            .port = settings.port
-        };
-
-        tcpqueue_t *queue;
-        ret = tcp_listen(l_tcp, settings.backlog, &queue);
-        BUG_ON(ret);
-
-        // Accept new connections
-        while (true) {
-            tcpconn_t *conn;
-            ret = tcp_accept(queue, &conn);
-            BUG_ON(ret);
-            thread_spawn(handle_tcp_conn, conn);
-        }
+	int ret = srpc_enable(memcached_handler);
+	if (ret) panic("couldn't enable RPC server");
     }
 
     waitgroup_t wg;

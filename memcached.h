@@ -549,14 +549,6 @@ typedef struct _io_wrap {
 } io_wrap;
 #endif
 
-struct TcpRef {
-    mutex_t lock;
-    atomic_t ref_cnt;
-    tcpconn_t *conn;
-};
-
-void tcpref_put(struct TcpRef *t);
-
 /**
  * The structure representing a connection into memcached.
  */
@@ -631,7 +623,7 @@ struct conn {
     union {
         struct udp_spawn_data *spawn_data;
         // tcpconn_t *tcp_conn;
-        struct TcpRef *tcpref;
+	char* out;
     };
     
     unsigned char *hdrbuf; /* udp packet headers */

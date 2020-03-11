@@ -13,6 +13,7 @@
 #include <runtime/timer.h>
 #include <runtime/udp.h>
 #include <runtime/runtime.h>
+#include <runtime/rpc.h>
 
 #undef assert
 #define assert(x) BUG_ON(!(x))
