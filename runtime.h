@@ -3,6 +3,7 @@
 #include <base/lock.h>
 #include <base/log.h>
 #include <base/tcache.h>
+#include <base/thread.h>
 
 #include <net/ip.h>
 

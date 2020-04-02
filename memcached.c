@@ -69,7 +69,7 @@
 #define ntohs(x) ntoh16(x)
 
 static struct tcache *udp_conn_tcache;
-static __thread struct tcache_perthread udp_conn_tcache_pt;
+static DEFINE_PERTHREAD(struct tcache_perthread, udp_conn_tcache_pt);
 
 /*
  * forward declarations
@@ -720,7 +720,7 @@ static void conn_release_items(conn *c) {
 
     if (c->suffixleft != 0) {
         for (; c->suffixleft > 0; c->suffixleft--, c->suffixcurr++) {
-            do_cache_free(mythr()->suffix_cache, *(c->suffixcurr));
+            cache_free(mythr()->suffix_cache, *(c->suffixcurr)); // JF: use mutex acquiring version
         }
     }
 #ifdef EXTSTORE
@@ -815,7 +815,9 @@ static void conn_close(conn *c) {
     if (likely(IS_UDP(c->transport))) {
         conn_set_state(c, conn_parse_cmd);
         udp_spawn_data_release(c->spawn_data->release_data);
-        tcache_free(&udp_conn_tcache_pt, c);
+        preempt_disable();
+        tcache_free(&perthread_get(udp_conn_tcache_pt), c);
+        preempt_enable();
     } else {
         mutex_lock(&tcp_conn_lock);
         active_tcp_conns[c->idx] = active_tcp_conns[--nactiveconns];
@@ -3575,7 +3577,7 @@ static inline char *_ascii_get_suffix_buf(conn *c, int i) {
     }
     }
 
-    suffix = do_cache_alloc(mythr()->suffix_cache);
+    suffix = cache_alloc(mythr()->suffix_cache); // JF: force mutex use for preemption safety
     if (suffix == NULL) {
       STATS_LOCK();
       stats.malloc_fails++;
@@ -3825,7 +3827,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 while (i-- > 0) {
                     item_remove(*(c->ilist + i));
                     if (return_cas || !settings.inline_ascii_response) {
-                        do_cache_free(mythr()->suffix_cache, *(c->suffixlist + i));
+                        cache_free(mythr()->suffix_cache, *(c->suffixlist + i)); // JF - preemption safety use mutex acquiring variant
                     }
                 }
                 return;
@@ -5735,10 +5737,13 @@ static void udp_handler(struct udp_spawn_data *d) {
 
     size_t res = d->len;
 
-    if (res <= 8 || (c = tcache_alloc(&udp_conn_tcache_pt)) == NULL) {
+    preempt_disable();
+    if (res <= 8 || (c = tcache_alloc(&perthread_get(udp_conn_tcache_pt))) == NULL) {
+        preempt_enable();
         udp_spawn_data_release(d->release_data);
         return;
     }
+    preempt_enable();
 
     c->spawn_data = d;
 
@@ -7826,7 +7831,7 @@ int perthread_initializer(void);
 
 int perthread_initializer(void)
 {
-    tcache_init_perthread(udp_conn_tcache, &udp_conn_tcache_pt);
+    tcache_init_perthread(udp_conn_tcache, &perthread_get(udp_conn_tcache_pt));
 
     return memcached_perthread_init();
 }
@@ -7840,15 +7845,18 @@ int late_initializer(void)
     void *conns[NREP];
     int i,j;
 
+    preempt_disable();
     for (i = 0; i < NREP; i++) {
-        conns[i] = tcache_alloc(&udp_conn_tcache_pt);
+        conns[i] = tcache_alloc(&perthread_get(udp_conn_tcache_pt));
         if(!conns[i])
             break;
     }
 
     for (j = 0; j < i; j++) {
-        tcache_free(&udp_conn_tcache_pt, conns[j]);
+        tcache_free(&perthread_get(udp_conn_tcache_pt), conns[j]);
     }
+
+    preempt_enable();
     return i == NREP ? 0 : -1;
 }
 

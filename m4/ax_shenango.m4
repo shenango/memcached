@@ -54,7 +54,7 @@ AC_CACHE_CHECK([for shenango directory], ac_cv_shenango_dir, [
 ])
   fi
 ])
-SHEN_LIBS="$RUNTIME_LIBS"
+SHEN_LIBS="$ac_cv_shenango_dir/shim/mem.o $RUNTIME_LIBS -ldl"
 if test $ac_cv_shenango_dir != "(system)"; then
     SHEN_LDFLAGS="-no-pie -L$ac_cv_shenango_dir -T $ac_cv_shenango_dir/base/base.ld"
     le_libdir="$ac_cv_shenango_dir"

@@ -1024,7 +1024,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
                             it->it_flags |= ITEM_ACTIVE;
                             if (ITEM_lruid(it) != COLD_LRU) {
                                 do_item_update(it); // bump LA time
-                            } else if (!lru_bump_async(mythr()->lru_bump_buf, it, hv)) {
+                            } else if (!lru_bump_async(mythr()->lru_bump_buf, it, hv)) { /* note - this access is preemption safe since each lru_bump_buf is protected by its own mutex */
                                 // add flag before async bump to avoid race.
                                 it->it_flags &= ~ITEM_ACTIVE;
                             }
@@ -1304,7 +1304,8 @@ static bool lru_maintainer_bumps(void) {
     unsigned int size;
     unsigned int todo;
     bool bumped = false;
-    spin_lock(&bump_buf_lock);
+    // JF: lock not needed, list not modified after init.
+    // spin_lock(&bump_buf_lock);
     for (b = bump_buf_head; b != NULL; b=b->next) {
         mutex_lock(&b->mutex);
         be = (lru_bump_entry *) bipbuf_peek_all(b->buf, &size);
@@ -1329,20 +1330,21 @@ static bool lru_maintainer_bumps(void) {
         be = (lru_bump_entry *) bipbuf_poll(b->buf, size);
         mutex_unlock(&b->mutex);
     }
-    spin_unlock(&bump_buf_lock);
+    // spin_unlock(&bump_buf_lock);
     return bumped;
 }
 
 static uint64_t lru_total_bumps_dropped(void) {
     uint64_t total = 0;
     lru_bump_buf *b;
-    spin_lock(&bump_buf_lock);
+    // JF: lock not needed, list not modified after init.
+    // spin_lock(&bump_buf_lock);
     for (b = bump_buf_head; b != NULL; b=b->next) {
         mutex_lock(&b->mutex);
         total += b->dropped;
         mutex_unlock(&b->mutex);
     }
-    spin_unlock(&bump_buf_lock);
+    // spin_unlock(&bump_buf_lock);
     return total;
 }
 
