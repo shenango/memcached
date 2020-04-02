@@ -25,8 +25,9 @@
 
 
 /* TODO: put this in a struct and ditch the global vars. */
-static logger *logger_stack_head = NULL;
-static logger *logger_stack_tail = NULL;
+static struct rcu_hlist_head logger_stack;
+//static logger *logger_stack_head = NULL;
+//static logger *logger_stack_tail = NULL;
 static unsigned int logger_count = 0;
 static volatile int do_run_logger_thread = 1;
 static waitgroup_t logger_wg;
@@ -103,16 +104,12 @@ static uint64_t logger_get_gid(void) {
  */
 /* Add to the list of threads with a logger object */
 static void logger_link_q(logger *l) {
-    spin_lock(&logger_stack_lock);
-    assert(l != logger_stack_head);
+    spin_lock_np(&logger_stack_lock);
+    //assert(l != logger_stack_head);
 
-    l->prev = 0;
-    l->next = logger_stack_head;
-    if (l->next) l->next->prev = l;
-    logger_stack_head = l;
-    if (logger_stack_tail == 0) logger_stack_tail = l;
+    rcu_hlist_add_head(&logger_stack, &l->rculink);
     logger_count++;
-    spin_unlock(&logger_stack_lock);
+    spin_unlock_np(&logger_stack_lock);
     return;
 }
 
@@ -152,8 +149,10 @@ static void logger_set_flags(void) {
 
         f |= w->eflags;
     }
-    for (l = logger_stack_head; l != NULL; l=l->next) {
-        mutex_lock(&l->mutex);
+	struct rcu_hlist_node *n;
+	rcu_hlist_for_each(&logger_stack, n, true) {
+	l = rcu_hlist_entry(n, logger, rculink);
+	mutex_lock(&l->mutex);
         l->eflags = f;
         mutex_unlock(&l->mutex);
     }
@@ -539,14 +538,14 @@ static void logger_thread(void *arg) {
             timer_sleep(to_sleep);
 
         /* Call function to iterate each logger. */
-        spin_lock(&logger_stack_lock);
-        for (l = logger_stack_head; l != NULL; l=l->next) {
-            /* lock logger, call function to manipulate it */
-            found_logs += logger_thread_read(l, &ls);
+	struct rcu_hlist_node *n;
+        rcu_hlist_for_each(&logger_stack, n, true) {
+		l = rcu_hlist_entry(n, logger, rculink);
+	            found_logs += logger_thread_read(l, &ls);
         }
 
         logger_thread_poll_watchers(1, WATCHER_ALL);
-        spin_unlock(&logger_stack_lock);
+        //spin_unlock(&logger_stack_lock);
 
         /* TODO: abstract into a function and share with lru_crawler */
         if (!found_logs) {
@@ -595,12 +594,12 @@ void logger_init(void) {
     /* TODO: error handling */
 
     /* init stack for iterating loggers */
-    logger_stack_head = 0;
-    logger_stack_tail = 0;
+    //logger_stack_head = 0;
+    //logger_stack_tail = 0;
 
     spin_lock_init(&logger_stack_lock);
     mutex_init(&logger_atomics_mutex);
-
+    rcu_hlist_init_head(&logger_stack);
 
     /* This can be removed once the global stats initializer is improved */
     stats.log_worker_dropped = 0;
@@ -802,8 +801,9 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
 enum logger_add_watcher_ret logger_add_watcher(void *c, uint16_t f) {
     int x;
     logger_watcher *w = NULL;
-    spin_lock(&logger_stack_lock);
+    spin_lock_np(&logger_stack_lock);
     if (watcher_count >= WATCHER_LIMIT) {
+        spin_unlock_np(&logger_stack_lock);
         return LOGGER_ADD_WATCHER_TOO_MANY;
     }
 
@@ -814,7 +814,7 @@ enum logger_add_watcher_ret logger_add_watcher(void *c, uint16_t f) {
 
     w = calloc(1, sizeof(logger_watcher));
     if (w == NULL) {
-        spin_unlock(&logger_stack_lock);
+        spin_unlock_np(&logger_stack_lock);
         return LOGGER_ADD_WATCHER_FAILED;
     }
     w->c = c;
@@ -828,7 +828,7 @@ enum logger_add_watcher_ret logger_add_watcher(void *c, uint16_t f) {
     w->buf = bipbuf_new(settings.logger_watcher_buf_size);
     if (w->buf == NULL) {
         free(w);
-        spin_unlock(&logger_stack_lock);
+        spin_unlock_np(&logger_stack_lock);
         return LOGGER_ADD_WATCHER_FAILED;
     }
     bipbuf_offer(w->buf, (unsigned char *) "OK\r\n", 4);
@@ -839,6 +839,6 @@ enum logger_add_watcher_ret logger_add_watcher(void *c, uint16_t f) {
     /* Update what flags the global logs will watch */
     logger_set_flags();
 
-    spin_unlock(&logger_stack_lock);
+    spin_unlock_np(&logger_stack_lock);
     return LOGGER_ADD_WATCHER_OK;
 }

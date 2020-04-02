@@ -4,6 +4,8 @@
 
 #include "bipbuffer.h"
 
+#include "runtime.h"
+
 /* TODO: starttime tunable */
 #define LOGGER_BUF_SIZE 1024 * 64
 #define LOGGER_WATCHER_BUF_SIZE 1024 * 256
@@ -119,8 +121,7 @@ typedef struct _logentry {
 #define LOG_RAWCMDS    (1<<9) /* raw ascii commands */
 
 typedef struct _logger {
-    struct _logger *prev;
-    struct _logger *next;
+    struct rcu_hlist_node rculink;
     mutex_t mutex; /* guard for this + *buf */
     uint64_t written; /* entries written to the buffer */
     uint64_t dropped; /* entries dropped */
