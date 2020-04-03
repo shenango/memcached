@@ -656,12 +656,12 @@ inline PHYS_THREAD *mythr(void)
 
 static inline void STATS_LOCAL_LOCK(void)
 {
-	mutex_lock(&mythr()->stats.mutex);
+//	mutex_lock(&mythr()->stats.mutex);
 }
 
 static inline void STATS_LOCAL_UNLOCK(void)
 {
-	mutex_unlock(&mythr()->stats.mutex);
+//	mutex_unlock(&mythr()->stats.mutex);
 }
 
 /* current time of day (updated periodically) */
