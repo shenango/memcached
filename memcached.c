@@ -1310,6 +1310,8 @@ static void add_bin_header(conn *c, uint16_t err, uint8_t hdr_len, uint16_t key_
     header->response.opaque = c->opaque;
     header->response.cas = htonll(c->cas);
 
+
+    header->response.cas = htonll(rdtsc());
     if (settings.verbose > 1) {
         int ii;
         fprintf(stderr, ">%p Writing bin response:", c);
@@ -1660,7 +1662,7 @@ static void process_bin_get_or_touch(conn *c) {
         }
 
         add_bin_header(c, 0, sizeof(rsp->message.body), keylen, bodylen);
-        rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
+//        rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
 
         // add the flags
         if (settings.inline_ascii_response) {
