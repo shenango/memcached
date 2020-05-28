@@ -81,6 +81,15 @@ enum try_read_result {
     READ_MEMORY_ERROR      /** failed to allocate more memory */
 };
 
+static inline uint64_t rdtsc(void)
+{
+        uint32_t a, d;
+        asm volatile("rdtsc" : "=a" (a), "=d" (d));
+        return ((uint64_t)a) | (((uint64_t)d) << 32);
+}
+
+
+
 static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
 
@@ -1287,6 +1296,8 @@ static void add_bin_header(conn *c, uint16_t err, uint8_t hdr_len, uint16_t key_
     header->response.opaque = c->opaque;
     header->response.cas = htonll(c->cas);
 
+
+    header->response.cas = htonll(rdtsc());
     if (settings.verbose > 1) {
         int ii;
         fprintf(stderr, ">%d Writing bin response:", c->sfd);
@@ -1637,7 +1648,7 @@ static void process_bin_get_or_touch(conn *c) {
         }
 
         add_bin_header(c, 0, sizeof(rsp->message.body), keylen, bodylen);
-        rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
+//        rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
 
         // add the flags
         if (settings.inline_ascii_response) {
