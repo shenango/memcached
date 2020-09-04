@@ -17,7 +17,7 @@ AC_CACHE_CHECK([for shenango directory], ac_cv_shenango_dir, [
   saved_CPPFLAGS="$CPPFLAGS"
   le_found=no
   for ledir in $tryshenangodir "" $prefix /usr/local ; do
-    RUNTIME_LIBS=$(cd $ledir && make -f shared.mk print-RUNTIME_LIBS ROOT_PATH=$ledir | grep RUNTIME_LIBS | sed 's/.*= //g')
+    RUNTIME_LIBS=$(make -f $ledir/Makefile print-RUNTIME_LIBS ROOT_PATH=$ledir | grep RUNTIME_LIBS | sed 's/.*= //g')
 
     LDFLAGS="$saved_LDFLAGS"
     LIBS="$RUNTIME_LIBS $saved_LIBS"

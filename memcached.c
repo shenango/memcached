@@ -263,7 +263,7 @@ static void settings_init(void) {
     settings.temporary_ttl = 61;
     settings.idle_timeout = 0; /* disabled */
     settings.hashpower_init = 0;
-    settings.slab_reassign = true;
+    settings.slab_reassign = false;
     settings.slab_automove = 1;
     settings.slab_automove_ratio = 0.8;
     settings.slab_automove_window = 30;
@@ -5497,7 +5497,7 @@ void drive_machine(void *arg) {
                 STATS_LOCAL_LOCK();
                 mythr()->stats.conn_yields++;
                 STATS_LOCAL_UNLOCK();
-                thread_yield();
+                // thread_yield();
                 nreqs = settings.reqs_per_event;
             }
             break;
@@ -7220,7 +7220,7 @@ static void arg_parse(void *arg)
                 break;
             case NO_LRU_MAINTAINER:
                 start_lru_maintainer = false;
-                settings.lru_segmented = false;
+                settings.lru_segmented = true;
                 break;
 #ifdef EXTSTORE
             case EXT_PAGE_SIZE:
