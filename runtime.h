@@ -13,11 +13,6 @@
 #include <runtime/timer.h>
 #include <runtime/udp.h>
 #include <runtime/runtime.h>
-#include <breakwater.h>
-#include <dagor.h>
-#include <seda.h>
-#include <nocontrol.h>
-#include <rpc.h>
 
 #undef assert
 #define assert(x) BUG_ON(!(x))

@@ -26,6 +26,12 @@
 #include <ctype.h>
 #include <stdarg.h>
 
+/* breakwater libraries */
+#include <breakwater/breakwater.h>
+#include <breakwater/dagor.h>
+#include <breakwater/seda.h>
+#include <breakwater/nocontrol.h>
+
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
 #ifndef _P1003_1B_VISIBLE
