@@ -17,7 +17,7 @@ AC_CACHE_CHECK([for shenango directory], ac_cv_shenango_dir, [
   saved_CPPFLAGS="$CPPFLAGS"
   le_found=no
   for ledir in $tryshenangodir "" $prefix /usr/local ; do
-    RUNTIME_LIBS=$(cd $ledir && make -f shared.mk print-RUNTIME_LIBS ROOT_PATH=$ledir | grep RUNTIME_LIBS | sed 's/.*= //g')
+    RUNTIME_LIBS=$(cd $ledir && make -f build/shared.mk print-RUNTIME_LIBS ROOT_PATH=$ledir | grep RUNTIME_LIBS | sed 's/.*= //g')
 
     LDFLAGS="$saved_LDFLAGS"
     LIBS="$RUNTIME_LIBS $saved_LIBS"
@@ -54,11 +54,11 @@ AC_CACHE_CHECK([for shenango directory], ac_cv_shenango_dir, [
 ])
   fi
 ])
-SHEN_LIBS="$RUNTIME_LIBS"
+SHEN_LIBS="$RUNTIME_LIBS -lbreakwater"
 if test $ac_cv_shenango_dir != "(system)"; then
-    SHEN_LDFLAGS="-no-pie -L$ac_cv_shenango_dir -T $ac_cv_shenango_dir/base/base.ld"
+    SHEN_LDFLAGS="-no-pie -L$ac_cv_shenango_dir -L$ac_cv_shenango_dir/breakwater -T $ac_cv_shenango_dir/base/base.ld"
     le_libdir="$ac_cv_shenango_dir"
-    SHEN_CPPFLAGS="-I$ac_cv_shenango_dir/inc"
+    SHEN_CPPFLAGS="-I$ac_cv_shenango_dir/inc -I$ac_cv_shenango_dir/breakwater/inc"
 fi
 SHEN_CPPFLAGS="-DNDEBUG -O3 -Wall -std=gnu11 -D_GNU_SOURCE -mssse3 $SHEN_CPPFLAGS"
 

@@ -126,6 +126,8 @@ struct stats stats;
 struct stats_state stats_state;
 struct settings settings;
 time_t process_started;     /* when the process was started */
+const struct crpc_ops *crpc_ops;
+const struct srpc_ops *srpc_ops;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
@@ -7822,7 +7824,7 @@ static void memcached_main(void *arg)
     }
 
     if (settings.port) {
-	int ret = srpc_enable(memcached_handler);
+	int ret = srpc_ops->srpc_enable(memcached_handler);
 	if (ret) panic("couldn't enable RPC server");
     }
 
@@ -7904,6 +7906,9 @@ int main(int argc, char **argv) {
     argv[1] = argv[0];
 
     arg_parse(argv + 1);
+
+    crpc_ops = &cbw_ops;
+    srpc_ops = &sbw_ops;
 
     validate_settings();
 
