@@ -7908,20 +7908,36 @@ int main(int argc, char **argv) {
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
 
-    char *cfgpath = argv[1];
-    argv[1] = argv[0];
+    char *ocalg = argv[1];
+    char *cfgpath = argv[2];
 
-    arg_parse(argv + 1);
+    if (strncmp(ocalg, "breakwater", 10) == 0) {
+        crpc_ops = &cbw_ops;
+	srpc_ops = &sbw_ops;
+    } else if (strncmp(ocalg, "dagor", 5) == 0) {
+        crpc_ops = &cdg_ops;
+	srpc_ops = &sdg_ops;
+    } else if (strncmp(ocalg, "seda", 4) == 0) {
+        crpc_ops = &csd_ops;
+	srpc_ops = &ssd_ops;
+    } else if (strncmp(ocalg, "nocontrol", 9) == 0) {
+        crpc_ops = &cnc_ops;
+	srpc_ops = &snc_ops;
+    } else {
+        printf("Invalid overload control algorithm: %s\n", ocalg);
+	return -EINVAL;
+    }
 
-    crpc_ops = &cbw_ops;
-    srpc_ops = &sbw_ops;
+    argv[2] = argv[0];
+
+    arg_parse(argv + 2);
 
     validate_settings();
 
     ret = runtime_set_initializers(memcached_init, perthread_initializer, late_initializer);
     BUG_ON(ret);
 
-    ret = runtime_init(cfgpath, memcached_main, argv + 1);
+    ret = runtime_init(cfgpath, memcached_main, argv + 2);
     if (ret) {
             printf("failed to start runtime\n");
             return ret;
