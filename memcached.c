@@ -33,6 +33,7 @@
 #include <breakwater/nocontrol.h>
 
 #define RPC_STAT_PORT 8002
+#define RPC_STAT_MAGIC 0xDEADBEEF
 
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
@@ -7697,8 +7698,7 @@ static void rpc_stat_worker(void *arg) {
 
 	if (ret <= 0) goto done;
 
-	if (ret != (ssize_t)sizeof(magic) || ntoh64(magic) != 0xDEADBEEF) {
-            printf("ret = %ld, magic = %lu (%lu)\n", ret, ntoh64(magic), (uint64_t)0xDEADBEEF);
+	if (ret != (ssize_t)sizeof(magic) || ntoh64(magic) != RPC_STAT_MAGIC) {
             WARN();
 	    goto done;
 	}
