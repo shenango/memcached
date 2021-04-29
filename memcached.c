@@ -32,6 +32,8 @@
 #include <breakwater/seda.h>
 #include <breakwater/nocontrol.h>
 
+#define RPC_STAT_PORT 8002
+
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
 #ifndef _P1003_1B_VISIBLE
@@ -7670,10 +7672,90 @@ static int memcached_init(void) {
     return 0;
 }
 
+static void rpc_stat_worker(void *arg) {
+    tcpconn_t *c = arg;
+
+    struct {
+        uint64_t idle;
+	uint64_t busy;
+	unsigned int num_cores;
+	unsigned int max_cores;
+	uint64_t winu_rx;
+	uint64_t winu_tx;
+	uint64_t win_tx;
+	uint64_t req_rx;
+	uint64_t req_dropped;
+	uint64_t resp_tx;
+    } sstat_raw;
+
+    uint64_t magic;
+    ssize_t ret;
+    ssize_t done;
+
+    while(true) {
+        ret = tcp_read(c, &magic, sizeof(magic));
+
+	if (ret <= 0) goto done;
+
+	if (ret != (ssize_t)sizeof(magic) || ntoh64(magic) != 0xDEADBEEF) {
+            printf("ret = %ld, magic = %lu (%lu)\n", ret, ntoh64(magic), (uint64_t)0xDEADBEEF);
+            WARN();
+	    goto done;
+	}
+
+	sstat_raw.idle = 0; // not supported yet
+	sstat_raw.busy = 0; // not supported yet
+	sstat_raw.num_cores = runtime_max_cores();
+	sstat_raw.max_cores = (unsigned int)sysconf(_SC_NPROCESSORS_ONLN);
+	sstat_raw.winu_rx = srpc_ops->srpc_stat_winu_rx();
+	sstat_raw.winu_tx = srpc_ops->srpc_stat_winu_tx();
+	sstat_raw.win_tx = srpc_ops->srpc_stat_win_tx();
+	sstat_raw.req_rx = srpc_ops->srpc_stat_req_rx();
+	sstat_raw.req_dropped = srpc_ops->srpc_stat_req_dropped();
+	sstat_raw.resp_tx = srpc_ops->srpc_stat_resp_tx();
+
+	done = 0;
+	do {
+            ret = tcp_write(c, (char *)&sstat_raw + done, sizeof(sstat_raw) - done);
+	    if (ret < 0) {
+                WARN_ON(ret != -EPIPE && ret != -ECONNRESET);
+		goto done;
+	    }
+	    done += ret;
+	} while (done < sizeof(sstat_raw));
+    }
+done:
+    tcp_close(c);
+    return;
+}
+
+static void rpc_stat_server(void *arg) {
+    struct netaddr laddr;
+    tcpconn_t *c;
+    tcpqueue_t *q;
+    int ret;
+
+    laddr.ip = 0;
+    laddr.port = RPC_STAT_PORT;
+
+    ret = tcp_listen(laddr, 4096, &q);
+    BUG_ON(ret);
+
+    while(true) {
+        ret = tcp_accept(q, &c);
+	BUG_ON(ret);
+	ret = thread_spawn(rpc_stat_worker, c);
+	WARN_ON(ret);
+    }
+}
+
 static void memcached_main(void *arg)
 {
 
     int ret;
+    /* RPCStat server thread  */
+    ret = thread_spawn(rpc_stat_server, NULL);
+
     /* initialize other stuff */
    if (start_logger_thread() != 0) {
         abort();
