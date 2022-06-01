@@ -6413,6 +6413,7 @@ static void save_pid(const char *pid_file) {
     }
 }
 
+#if 0
 static void remove_pidfile(const char *pid_file) {
   if (pid_file == NULL)
       return;
@@ -6422,6 +6423,7 @@ static void remove_pidfile(const char *pid_file) {
   }
 
 }
+#endif
 
 static void sig_handler(const int sig) {
     printf("Signal handled: %s.\n", strsignal(sig));
@@ -6547,7 +6549,7 @@ static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
 
 
 static bool lock_memory = false;
-static bool do_daemonize = false;
+//static bool do_daemonize = false;
 static bool preallocate = false;
 static int maxcore = 0;
 static char *username = NULL;
@@ -6880,7 +6882,8 @@ static void arg_parse(void *arg)
             }
             break;
         case 'd':
-            do_daemonize = true;
+            printf("Daemonize not supported\n");
+            exit(-1);
             break;
         case 'r':
             maxcore = 1;
@@ -7574,6 +7577,7 @@ static int memcached_init(void) {
         init_sasl();
     }
 
+#if 0
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
     if (do_daemonize) {
@@ -7585,6 +7589,7 @@ static int memcached_init(void) {
             return EXIT_FAILURE;
         }
     }
+#endif
 
     /* lock paged memory if needed */
     if (lock_memory) {
@@ -7809,10 +7814,12 @@ static void memcached_main(void *arg)
     waitgroup_wait(&wg);
 
     stop_assoc_maintenance_thread();
-
+#if 0
     /* remove the PID file if we're a daemon */
     if (do_daemonize)
         remove_pidfile(pid_file);
+#endif
+
 #if 0
     /* Clean up strdup() call for bind() address */
     if (settings.inter)
